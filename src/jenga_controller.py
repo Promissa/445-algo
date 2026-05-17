@@ -54,7 +54,11 @@ try:
         _calibration_camera_worker,
         all_cameras_live,
         build_states,
+        compute_aligned_lines,
+        draw_aligned_lines_in_viewer,
+        draw_brick_models_in_viewer,
         freeze_calibration,
+        gather_tag_world_positions,
         save_calib_with_distance,
     )
 except ImportError:
@@ -88,7 +92,11 @@ except ImportError:
         _calibration_camera_worker,
         all_cameras_live,
         build_states,
+        compute_aligned_lines,
+        draw_aligned_lines_in_viewer,
+        draw_brick_models_in_viewer,
         freeze_calibration,
+        gather_tag_world_positions,
         save_calib_with_distance,
     )
 
@@ -103,8 +111,13 @@ FACE_PUSHROD_THRESHOLD = 0.85
 DEFAULT_PUSH_DURATION = 1.5
 # DC motor duty for push (0-255)
 DEFAULT_PUSH_DC_DUTY = 180
-# Delay before checking whether the human player removed a brick.
-PLAYER_REMOVAL_WAIT_SECONDS = 20.0
+# A brick is considered gone once its midpoint moves this far from its
+# TOWER_INIT midpoint.
+BRICK_GONE_DISTANCE = 2.0
+# First layer considered by the full-layer AUTO_PUSH search.
+FULL_LAYER_SEARCH_FIRST_LAYER = 1
+# Target refresh rate for the optional MuJoCo live tower viewer.
+LIVE_VIEW_UPDATE_SECONDS = 0.25
 
 GAME_WIN = "win"
 GAME_LOSE = "lose"
@@ -130,6 +143,26 @@ def _bypass_calib_camera_worker(
         if state.dist_map1 is not None:
             frame = cv2.remap(frame, state.dist_map1, state.dist_map2, cv2.INTER_LINEAR)
 
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        dets = state.detector.detect(
+            gray,
+            estimate_tag_pose=True,
+            camera_params=(
+                float(state.K[0, 0]),
+                float(state.K[1, 1]),
+                float(state.K[0, 2]),
+                float(state.K[1, 2]),
+            ),
+            tag_size=float(state.tag_size),
+        )
+        tag_positions_cam: Dict[int, np.ndarray] = {}
+        for det in dets:
+            tid = int(getattr(det, "tag_id", -1))
+            if hasattr(det, "pose_t"):
+                tag_positions_cam[tid] = np.asarray(
+                    det.pose_t, dtype=np.float64
+                ).reshape(3)
+
         with state.lock:
             if state.stored_p is not None and state.stored_R is not None:
                 state.p_w_c = state.stored_p.copy()
@@ -137,6 +170,7 @@ def _bypass_calib_camera_worker(
                 state.reproj = 0.0
             state.n_visible = 4
             state.latest_frame_bgr = frame.copy()
+            state.tag_positions_cam = tag_positions_cam
 
 
 class Phase(Enum):
@@ -304,6 +338,8 @@ class JengaController:
     )
     last_grid: GridResult = field(default_factory=GridResult)
     last_brick_count: int = 0
+    initial_brick_midpoints: Dict[int, np.ndarray] = field(default_factory=dict)
+    gone_brick_ids: set[int] = field(default_factory=set)
     stable_brick_count: int = 0
     stable_since: float = 0.0
     player_wait_started_at: float = 0.0
@@ -314,6 +350,11 @@ class JengaController:
     push_dc_duty: int = DEFAULT_PUSH_DC_DUTY
     push_duration: float = DEFAULT_PUSH_DURATION
 
+    # Live visualization
+    live: bool = False
+    live_xml_path: Optional[Path] = None
+    live_lookat: Optional[np.ndarray] = None
+
     # Flags
     calibration_locked: bool = False
     bypass_calib: bool = False
@@ -321,7 +362,8 @@ class JengaController:
 
     # Internal
     _lock: threading.Lock = field(default_factory=threading.Lock)
-    _full_layer_search_start: int = 0
+    _full_layer_search_start: int = FULL_LAYER_SEARCH_FIRST_LAYER
+    _last_live_view_update: float = 0.0
 
     # ------------------------------------------------------------------
     # Serial helpers
@@ -386,12 +428,30 @@ class JengaController:
                 return
         raise TimeoutError(f"Timeout waiting for {expected}; last response: {last_line}")
 
+    def _send_rotation_command_ignore_errors(self, cmd: str, drain_seconds: float = 0.5) -> None:
+        """Send a rotation-related command and ignore all immediate ERR responses."""
+        self.arduino.send(cmd)
+        deadline = time.monotonic() + drain_seconds
+        while time.monotonic() < deadline:
+            line = self.arduino._readline()
+            if not line:
+                continue
+            if line.startswith("ERR "):
+                print(f"  Ignored Arduino error during rotation command '{cmd}': {line}")
+                continue
+            if line in {"OK", "PONG"} or line.startswith("DONE "):
+                return
+
     def _rotate_z_with_x_retract(self, z_steps: int) -> None:
         """Retract X before any Z rotation."""
-        self._send_and_wait("MOVE X -10000")
+        self._send_rotation_command_ignore_errors("MOVE X -10000")
         self._wait_for_done("X")
-        self._send_and_wait(f"BM Z {z_steps}", timeout=5.0, ignore_errors=True)
+        self.arduino.send(f"BM Z {z_steps}")
         self._wait_for_done_signal("Z", timeout=max(30.0, abs(float(z_steps)) * 3.0))
+
+    def _finish_auto_push_x_move(self) -> None:
+        self._send_and_wait("MOVE X 10000", timeout=2.0, ignore_errors=True)
+        self._wait_for_done("X")
 
     def _run_auto_push(self) -> bool:
         self.arduino.send("AUTO_PUSH")
@@ -403,12 +463,34 @@ class JengaController:
                 continue
             last_line = line
             if line == "AUTO_PUSH SUCCESS":
+                self._finish_auto_push_x_move()
                 return True
-            if line.startswith("AUTO_PUSH FAILED") or line.startswith("ERR "):
+            if line.startswith("ERR "):
+                print(f"  Ignored Arduino error during AUTO_PUSH: {line}")
+                continue
+            if line == "WARN: AUTO_PUSH FAILED":
+                self._finish_auto_push_x_move()
                 raise RuntimeError(line)
         raise TimeoutError(
             f"AUTO_PUSH did not return a final success/failure signal; last response: {last_line}"
         )
+
+    def _read_a1(self, timeout: float = 2.0) -> Optional[int]:
+        self.arduino.send("A1?")
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            line = self.arduino._readline()
+            if not line:
+                continue
+            if line.startswith("ERR "):
+                print(f"  Ignored Arduino error while reading A1: {line}")
+                continue
+            if line.startswith("A1="):
+                try:
+                    return int(line.split("=", 1)[1].strip().split()[0])
+                except ValueError:
+                    return None
+        return None
 
     def _move_to_layer(self, new_layer_id: int) -> None:
         delta = int(new_layer_id) - int(self.current_layer_id)
@@ -469,11 +551,61 @@ class JengaController:
 
     def _check_collapse(self, current_count: int) -> bool:
         """Return True if tower has collapsed."""
-        if self.last_brick_count - current_count > 2:
-            return True
         if current_count < 4:
             return True
         return False
+
+    def _record_initial_brick_midpoints(
+        self, fitted: Dict[int, Tuple[np.ndarray, np.ndarray]]
+    ) -> None:
+        self.initial_brick_midpoints = {
+            bi: t.copy() for bi, (t, _R) in fitted.items()
+        }
+        self.gone_brick_ids.clear()
+        self.last_brick_count = len(self.initial_brick_midpoints)
+
+    def _gone_bricks_from_initial(
+        self, fitted: Dict[int, Tuple[np.ndarray, np.ndarray]]
+    ) -> set[int]:
+        gone = set(self.gone_brick_ids)
+        for bi, initial_t in self.initial_brick_midpoints.items():
+            current = fitted.get(bi)
+            if current is None:
+                gone.add(bi)
+                continue
+            current_t, _R = current
+            if np.linalg.norm(current_t - initial_t) >= BRICK_GONE_DISTANCE:
+                gone.add(bi)
+        return gone
+
+    def _active_fitted(
+        self,
+        fitted: Dict[int, Tuple[np.ndarray, np.ndarray]],
+        gone_ids: Optional[set[int]] = None,
+    ) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
+        if not self.initial_brick_midpoints:
+            return fitted
+        if gone_ids is None:
+            gone_ids = self._gone_bricks_from_initial(fitted)
+        return {
+            bi: pose
+            for bi, pose in fitted.items()
+            if bi in self.initial_brick_midpoints and bi not in gone_ids
+        }
+
+    def _set_gone_bricks(
+        self,
+        fitted: Dict[int, Tuple[np.ndarray, np.ndarray]],
+        gone_ids: set[int],
+    ) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
+        self.gone_brick_ids = set(gone_ids)
+        active = self._active_fitted(fitted, self.gone_brick_ids)
+        self.last_brick_count = len(self.initial_brick_midpoints) - len(
+            self.gone_brick_ids
+        )
+        self.last_reconstruction = active
+        self.last_grid = bricks_to_grid(active, self.layer_count, self.bricks_per_layer)
+        return active
 
     def _enter_wait(self) -> None:
         self.player_wait_started_at = time.monotonic()
@@ -483,6 +615,28 @@ class JengaController:
     def _end_game(self, outcome: str) -> None:
         self.game_outcome = outcome
         self.phase = Phase.COLLAPSE
+
+    def _handle_successful_robot_push(self, phase_label: str) -> bool:
+        """Return False if the robot push removed too many bricks and loses."""
+        time.sleep(0.5)
+        fitted = self._reconstruct()
+        gone_ids = self._gone_bricks_from_initial(fitted)
+        newly_gone = gone_ids - self.gone_brick_ids
+
+        if len(newly_gone) >= 2:
+            active = self._set_gone_bricks(fitted, gone_ids)
+            print(
+                f"{phase_label} Robot push moved {len(newly_gone)} bricks at least "
+                f"{BRICK_GONE_DISTANCE:g} units from their initial midpoints. "
+                f"Machine failed. Active bricks: {len(active)}."
+            )
+            self._end_game(GAME_LOSE)
+            return False
+
+        if len(newly_gone) == 1:
+            self._set_gone_bricks(fitted, gone_ids)
+
+        return True
 
     # ------------------------------------------------------------------
     # Phase implementations
@@ -547,7 +701,11 @@ class JengaController:
                 self.last_grid = bricks_to_grid(
                     fitted, self.layer_count, self.bricks_per_layer
                 )
-                self.last_brick_count = count
+                self._record_initial_brick_midpoints(fitted)
+                print(
+                    f"[Phase TOWER_INIT] Recorded {len(self.initial_brick_midpoints)} "
+                    "initial brick midpoint(s)."
+                )
                 self._enter_wait()
                 return
         else:
@@ -557,72 +715,71 @@ class JengaController:
         time.sleep(1)
 
     def _do_wait(self) -> None:
-        now = time.monotonic()
-        if self.player_wait_started_at <= 0.0:
-            self.player_wait_started_at = now
-
-        elapsed = now - self.player_wait_started_at
-        if elapsed < PLAYER_REMOVAL_WAIT_SECONDS:
+        a1_value = self._read_a1()
+        if a1_value != 0:
             if not self.player_wait_announced:
-                print(
-                    "[Phase WAIT] Waiting 20s before checking whether the player removed a brick..."
-                )
+                print("[Phase WAIT] Waiting until Arduino A1 reads 0...")
                 self.player_wait_announced = True
-            time.sleep(0.5)
+            time.sleep(0.2)
             return
+        if self.player_wait_announced:
+            print("[Phase WAIT] Arduino A1 reads 0. Checking whether the player removed a brick...")
+            self.player_wait_announced = False
 
         fitted = self._reconstruct()
-        count = len(fitted)
-        removed_count = self.last_brick_count - count
+        gone_ids = self._gone_bricks_from_initial(fitted)
+        newly_gone = gone_ids - self.gone_brick_ids
 
-        if removed_count >= 2:
+        if len(newly_gone) >= 2:
+            active = self._set_gone_bricks(fitted, gone_ids)
             print(
-                f"[Phase WAIT] Player removed or displaced {removed_count} bricks: "
-                f"{self.last_brick_count} -> {count}. System wins."
-            )
-            self.last_reconstruction = fitted
-            self.last_grid = bricks_to_grid(
-                fitted, self.layer_count, self.bricks_per_layer
+                f"[Phase WAIT] Player moved {len(newly_gone)} bricks at least "
+                f"{BRICK_GONE_DISTANCE:g} units from their initial midpoints. "
+                f"System wins. Active bricks: {len(active)}."
             )
             self._end_game(GAME_WIN)
             return
 
-        if removed_count == 1:
-            print(f"[Phase WAIT] Brick removed: {self.last_brick_count} -> {count}")
-            self.last_brick_count = count
-            self.last_reconstruction = fitted
-            self.last_grid = bricks_to_grid(
-                fitted, self.layer_count, self.bricks_per_layer
+        if len(newly_gone) == 1:
+            active = self._set_gone_bricks(fitted, gone_ids)
+            print(
+                f"[Phase WAIT] Brick removed by midpoint displacement. "
+                f"Active bricks: {len(active)}."
             )
-            self._full_layer_search_start = 0
+            self._full_layer_search_start = FULL_LAYER_SEARCH_FIRST_LAYER
             self.phase = self.next_phase_after_wait
             return
 
-        if self._check_collapse(count):
-            print(f"[Phase WAIT] COLLAPSE detected: {self.last_brick_count} -> {count}")
+        active = self._active_fitted(fitted, gone_ids)
+        if self._check_collapse(len(active)):
+            print(f"[Phase WAIT] COLLAPSE detected. Active bricks: {len(active)}")
             self._end_game(GAME_LOSE)
             return
 
-        print("[Phase WAIT] No brick removed. Restarting 20s player wait.")
-        self.player_wait_started_at = time.monotonic()
+        print("[Phase WAIT] No brick removed. Waiting for Arduino A1 to read 0 again.")
         self.player_wait_announced = False
         time.sleep(0.5)
 
     def _do_full_layer_1(self) -> None:
         print("[Phase FULL_LAYER_1] Mapping grid...")
         fitted = self._reconstruct()
-        grid_result = bricks_to_grid(fitted, self.layer_count, self.bricks_per_layer)
+        gone_ids = self._gone_bricks_from_initial(fitted)
+        active = self._active_fitted(fitted, gone_ids)
+        grid_result = bricks_to_grid(active, self.layer_count, self.bricks_per_layer)
         self.last_grid = grid_result
 
         if self._check_collapse(grid_result.total):
-            print(f"[Phase FULL_LAYER_1] COLLAPSE: {self.last_brick_count} -> {grid_result.total}")
+            print(f"[Phase FULL_LAYER_1] COLLAPSE. Active bricks: {grid_result.total}")
             self._end_game(GAME_LOSE)
             return
 
         # Find a full layer (occupancy "111") in sequential order. A new robot
-        # turn starts from layer 0; retries continue upward from the last target.
+        # turn starts from layer 1; retries continue upward from the last target.
         target_layer: Optional[int] = None
-        search_start = max(0, min(self._full_layer_search_start, self.layer_count))
+        search_start = max(
+            FULL_LAYER_SEARCH_FIRST_LAYER,
+            min(self._full_layer_search_start, self.layer_count),
+        )
         for y in range(search_start, self.layer_count):
             if grid_result.occupancy.get(y) == "111":
                 target_layer = y
@@ -631,7 +788,7 @@ class JengaController:
         if target_layer is None:
             print("[Phase FULL_LAYER_1] No full layer found. Switching to LASTLY.")
             self.next_phase_after_wait = Phase.LASTLY
-            self._full_layer_search_start = 0
+            self._full_layer_search_start = FULL_LAYER_SEARCH_FIRST_LAYER
             self._enter_wait()
             return
 
@@ -666,9 +823,11 @@ class JengaController:
             time.sleep(0.5)
             return
 
-        print("[Phase FULL_LAYER_1] AUTO_PUSH succeeded. Jumping to next phase.")
-        self.last_brick_count -= 1
-        self._full_layer_search_start = 0
+        print("[Phase FULL_LAYER_1] AUTO_PUSH succeeded. Checking tower state.")
+        if not self._handle_successful_robot_push("[Phase FULL_LAYER_1]"):
+            return
+        print("[Phase FULL_LAYER_1] Jumping to next phase.")
+        self._full_layer_search_start = FULL_LAYER_SEARCH_FIRST_LAYER
         self._enter_wait()
 
     def _try_push_layer(
@@ -684,7 +843,9 @@ class JengaController:
             self._rotate_z_with_x_retract(1)
             # Reconstruct after rotation
             fitted = self._reconstruct()
-            grid_result = bricks_to_grid(fitted, self.layer_count, self.bricks_per_layer)
+            gone_ids = self._gone_bricks_from_initial(fitted)
+            active = self._active_fitted(fitted, gone_ids)
+            grid_result = bricks_to_grid(active, self.layer_count, self.bricks_per_layer)
             layer = grid_result.layers.get(target_y, [])
             if not layer_faces_pushrod(layer):
                 print(f"  Layer {target_y} still not facing after rotation. Skip.")
@@ -713,11 +874,15 @@ class JengaController:
             # Verify by reconstruction
             time.sleep(0.5)
             post_fitted = self._reconstruct()
-            if bi not in post_fitted:
-                print(f"  Brick {bi} confirmed removed.")
+            post_gone_ids = self._gone_bricks_from_initial(post_fitted)
+            if bi in post_gone_ids:
+                print(
+                    f"  Brick {bi} confirmed gone by midpoint displacement "
+                    f">= {BRICK_GONE_DISTANCE:g}."
+                )
                 return True
             else:
-                print(f"  Brick {bi} still present. Trying next.")
+                print(f"  Brick {bi} has not moved far enough. Trying next.")
 
         return False
 
@@ -747,11 +912,13 @@ class JengaController:
     def _do_lastly(self) -> None:
         print("[Phase LASTLY] Mapping grid...")
         fitted = self._reconstruct()
-        grid_result = bricks_to_grid(fitted, self.layer_count, self.bricks_per_layer)
+        gone_ids = self._gone_bricks_from_initial(fitted)
+        active = self._active_fitted(fitted, gone_ids)
+        grid_result = bricks_to_grid(active, self.layer_count, self.bricks_per_layer)
         self.last_grid = grid_result
 
         if self._check_collapse(grid_result.total):
-            print(f"[Phase LASTLY] COLLAPSE: {self.last_brick_count} -> {grid_result.total}")
+            print(f"[Phase LASTLY] COLLAPSE. Active bricks: {grid_result.total}")
             self._end_game(GAME_LOSE)
             return
 
@@ -787,8 +954,10 @@ class JengaController:
         pushed = self._try_push_layer(layer, target_y)
 
         if pushed:
-            print("[Phase LASTLY] Push succeeded. Returning to WAIT.")
-            self.last_brick_count -= 1
+            print("[Phase LASTLY] Push succeeded. Checking tower state.")
+            if not self._handle_successful_robot_push("[Phase LASTLY]"):
+                return
+            print("[Phase LASTLY] Returning to WAIT.")
             self._enter_wait()
         else:
             print("[Phase LASTLY] Push failed. Retrying.")
@@ -837,25 +1006,87 @@ class JengaController:
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
+    def _run_phase_once(self) -> None:
+        if self.phase == Phase.INIT:
+            self._do_init()
+        elif self.phase == Phase.TOWER_INIT:
+            self._do_tower_init()
+        elif self.phase == Phase.WAIT:
+            self._do_wait()
+        elif self.phase == Phase.FULL_LAYER_1:
+            self._do_full_layer_1()
+        elif self.phase == Phase.LASTLY:
+            self._do_lastly()
+
+    def _update_live_viewer(self, viewer, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._last_live_view_update < LIVE_VIEW_UPDATE_SECONDS:
+            return
+        self._last_live_view_update = now
+
+        tag_positions_per_cam = gather_tag_world_positions(
+            self.cam_states, prefer_stored=self.calibration_locked or self.bypass_calib
+        )
+        aligned_lines = compute_aligned_lines(
+            tag_positions_per_cam, start_id=self.recon_cfg.start_id
+        )
+        if self.gone_brick_ids:
+            aligned_lines = [
+                line
+                for line in aligned_lines
+                if int(line.get("base", -1)) not in self.gone_brick_ids
+            ]
+
+        viewer.user_scn.ngeom = 0
+        draw_aligned_lines_in_viewer(viewer, aligned_lines)
+        draw_brick_models_in_viewer(viewer, aligned_lines)
+        viewer.sync()
+
+    def _run_with_live_viewer(self) -> None:
+        if self.live_xml_path is None:
+            raise RuntimeError("--live requires a MuJoCo XML path")
+
+        import mujoco
+        import mujoco.viewer
+
+        model = mujoco.MjModel.from_xml_path(str(self.live_xml_path))
+        data = mujoco.MjData(model)
+        mujoco.mj_forward(model, data)
+
+        print(f"[Live] Opening MuJoCo viewer: {self.live_xml_path}")
+        with mujoco.viewer.launch_passive(model, data) as viewer:
+            if self.live_lookat is not None:
+                viewer.cam.lookat[:] = self.live_lookat
+            viewer.cam.distance = 12.0
+            viewer.cam.elevation = -25.0
+
+            while viewer.is_running() and self.phase != Phase.COLLAPSE:
+                self._run_phase_once()
+                self._update_live_viewer(viewer)
+                time.sleep(0.01)
+
+        if self.phase != Phase.COLLAPSE:
+            print("[Live] MuJoCo viewer closed; continuing controller without live view.")
+            self.live = False
+            while self.phase != Phase.COLLAPSE:
+                self._run_phase_once()
+                time.sleep(0.01)
+
     def run(self) -> None:
         print("=" * 60)
         print("Jenga Controller started")
         print(f"  Phase: {self.phase.name}")
+        if self.live:
+            print("  Live MuJoCo tower viewer: enabled")
         print("=" * 60)
 
         try:
-            while self.phase != Phase.COLLAPSE:
-                if self.phase == Phase.INIT:
-                    self._do_init()
-                elif self.phase == Phase.TOWER_INIT:
-                    self._do_tower_init()
-                elif self.phase == Phase.WAIT:
-                    self._do_wait()
-                elif self.phase == Phase.FULL_LAYER_1:
-                    self._do_full_layer_1()
-                elif self.phase == Phase.LASTLY:
-                    self._do_lastly()
-                time.sleep(0.01)
+            if self.live:
+                self._run_with_live_viewer()
+            else:
+                while self.phase != Phase.COLLAPSE:
+                    self._run_phase_once()
+                    time.sleep(0.01)
             self._do_collapse()
         except KeyboardInterrupt:
             print("\nInterrupted by user.")
@@ -888,6 +1119,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip live PnP calibration and use stored camera poses from --calib-in directly.",
     )
+    ap.add_argument(
+        "--live",
+        action="store_true",
+        help="Show a live MuJoCo viewer with the real-time reconstructed tower model.",
+    )
+    ap.add_argument("--xml", default="assets/scene_turntable_only_lowlookat.xml")
     ap.add_argument("--fovy", type=float, default=100.0)
     ap.add_argument("--width", type=int, default=1920)
     ap.add_argument("--height", type=int, default=1080)
@@ -940,6 +1177,16 @@ def main() -> int:
         timeout=args.timeout,
         reset_delay=2.0,
     )
+
+    live_xml_path: Optional[Path] = None
+    if args.live:
+        live_xml_path = Path(args.xml)
+        if not live_xml_path.is_absolute():
+            live_xml_path = base_dir / live_xml_path
+        if not live_xml_path.exists():
+            print(f"ERROR: XML not found for --live: {live_xml_path}", file=sys.stderr)
+            arduino.close()
+            return 1
 
     # --------------------------------------------------------------
     # Cameras
@@ -1028,6 +1275,9 @@ def main() -> int:
         bricks_per_layer=args.bricks_per_layer,
         push_dc_duty=args.push_dc_duty,
         push_duration=args.push_duration,
+        live=args.live,
+        live_xml_path=live_xml_path,
+        live_lookat=t_w_g.copy(),
         calibration_locked=args.bypass_calib,
         bypass_calib=args.bypass_calib,
     )
