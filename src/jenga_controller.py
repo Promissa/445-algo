@@ -42,8 +42,12 @@ try:
         CameraObsInput,
         ReconConfig,
         ReconOutput,
+        cv_point_to_world,
+        get_pupil_pose,
+        is_block_tag_id,
         reconstruct_blocks_multi_cam,
     )
+    from .apriltag_utils import detect_apriltags_silent
     from .view_camera_location import (
         BAR_HALF,
         FIXED_CAMERA_K,
@@ -80,8 +84,12 @@ except ImportError:
         CameraObsInput,
         ReconConfig,
         ReconOutput,
+        cv_point_to_world,
+        get_pupil_pose,
+        is_block_tag_id,
         reconstruct_blocks_multi_cam,
     )
+    from apriltag_utils import detect_apriltags_silent
     from view_camera_location import (
         BAR_HALF,
         FIXED_CAMERA_K,
@@ -111,16 +119,31 @@ FACE_PUSHROD_THRESHOLD = 0.85
 DEFAULT_PUSH_DURATION = 1.5
 # DC motor duty for push (0-255)
 DEFAULT_PUSH_DC_DUTY = 180
-# A brick is considered gone once its midpoint moves this far from its
-# TOWER_INIT midpoint.
-BRICK_GONE_DISTANCE = 2.0
 # First layer considered by the full-layer AUTO_PUSH search.
 FULL_LAYER_SEARCH_FIRST_LAYER = 1
+# Slot index of the middle brick within a 3-brick layer.
+MIDDLE_BRICK_SLOT = 1
+# Empty slot marker in the cached layer state tuple.
+EMPTY_BRICK_ID = -1
 # Target refresh rate for the optional MuJoCo live tower viewer.
 LIVE_VIEW_UPDATE_SECONDS = 0.25
 
+# Cached layer state: (axis_flag, slot0_brick_id, slot1_brick_id, slot2_brick_id).
+# axis_flag == 0 means the layer is currently accessible; 1 means rotate first.
+LayerState = Tuple[int, int, int, int]
+
 GAME_WIN = "win"
 GAME_LOSE = "lose"
+
+
+class _SilentDetectorProxy:
+    """Detector wrapper for imported workers that call .detect() directly."""
+
+    def __init__(self, detector):
+        self._detector = detector
+
+    def detect(self, *args, **kwargs):
+        return detect_apriltags_silent(self._detector, *args, **kwargs)
 
 
 def _bypass_calib_camera_worker(
@@ -144,7 +167,8 @@ def _bypass_calib_camera_worker(
             frame = cv2.remap(frame, state.dist_map1, state.dist_map2, cv2.INTER_LINEAR)
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        dets = state.detector.detect(
+        dets = detect_apriltags_silent(
+            state.detector,
             gray,
             estimate_tag_pose=True,
             camera_params=(
@@ -338,13 +362,24 @@ class JengaController:
     )
     last_grid: GridResult = field(default_factory=GridResult)
     last_brick_count: int = 0
+    initial_reconstruction: Dict[int, Tuple[np.ndarray, np.ndarray]] = field(
+        default_factory=dict
+    )
     initial_brick_midpoints: Dict[int, np.ndarray] = field(default_factory=dict)
+    initial_tag_ids_by_brick: Dict[int, set[int]] = field(default_factory=dict)
+    initial_layer_middle_brick_ids: Dict[int, int] = field(default_factory=dict)
+    initial_layer_slot_brick_ids: Dict[int, Dict[int, int]] = field(
+        default_factory=dict
+    )
+    layer_push_states: List[LayerState] = field(default_factory=list)
     gone_brick_ids: set[int] = field(default_factory=set)
     stable_brick_count: int = 0
     stable_since: float = 0.0
     player_wait_started_at: float = 0.0
     player_wait_announced: bool = False
     current_layer_id: int = 0
+    tower_init_y_raised: bool = False
+    tower_init_x_retracted: bool = False
 
     # Push parameters
     push_dc_duty: int = DEFAULT_PUSH_DC_DUTY
@@ -358,6 +393,7 @@ class JengaController:
     # Flags
     calibration_locked: bool = False
     bypass_calib: bool = False
+    xy_log: bool = False
     game_outcome: Optional[str] = None
 
     # Internal
@@ -448,13 +484,30 @@ class JengaController:
         self._wait_for_done("X")
         self.arduino.send(f"BM Z {z_steps}")
         self._wait_for_done_signal("Z", timeout=max(30.0, abs(float(z_steps)) * 3.0))
+        if abs(int(z_steps)) % 2 == 1:
+            self._toggle_layer_axes_after_z_rotation()
 
     def _finish_auto_push_x_move(self) -> None:
         self._send_and_wait("MOVE X 10000", timeout=2.0, ignore_errors=True)
         self._wait_for_done("X")
 
-    def _run_auto_push(self) -> bool:
-        self.arduino.send("AUTO_PUSH")
+    def _finish_auto_push_motion(self) -> None:
+        self._finish_auto_push_x_move()
+
+    @staticmethod
+    def _is_auto_push_success(line: str) -> bool:
+        parts = line.strip().split()
+        if len(parts) == 4 and parts[:3] == ["AUTO", "PUSH", "SUCCESS"]:
+            return True
+        if len(parts) == 3 and parts[:2] == ["AUTO_PUSH", "SUCCESS"]:
+            return True
+        if line == "AUTO_PUSH SUCCESS":
+            return True
+        return False
+
+    def _run_auto_push(self, target_layer: int, push_mask: int) -> None:
+        self._move_to_layer(target_layer)
+        self.arduino.send(f"AUTO_PUSH {push_mask & 0b111}")
         deadline = time.monotonic() + 180.0
         last_line = ""
         while time.monotonic() < deadline:
@@ -462,14 +515,25 @@ class JengaController:
             if not line:
                 continue
             last_line = line
-            if line == "AUTO_PUSH SUCCESS":
-                self._finish_auto_push_x_move()
-                return True
+            if self._is_auto_push_success(line):
+                self._finish_auto_push_motion()
+                print(
+                    "[Phase FULL_LAYER_1] AUTO_PUSH reported success; "
+                    "using tag visibility to identify removed brick."
+                )
+                return
+            if line.startswith("AUTO_PUSH A0_GROUNDED"):
+                print(
+                    "[Phase FULL_LAYER_1] AUTO_PUSH reported A0 grounded. "
+                    "Updating layer state from one-tag visibility."
+                )
+                self._update_gone_from_visibility("[Phase FULL_LAYER_1 AUTO_PUSH]")
+                continue
             if line.startswith("ERR "):
                 print(f"  Ignored Arduino error during AUTO_PUSH: {line}")
                 continue
             if line == "WARN: AUTO_PUSH FAILED":
-                self._finish_auto_push_x_move()
+                self._finish_auto_push_motion()
                 raise RuntimeError(line)
         raise TimeoutError(
             f"AUTO_PUSH did not return a final success/failure signal; last response: {last_line}"
@@ -556,37 +620,213 @@ class JengaController:
         return False
 
     def _record_initial_brick_midpoints(
-        self, fitted: Dict[int, Tuple[np.ndarray, np.ndarray]]
+        self,
+        fitted: Dict[int, Tuple[np.ndarray, np.ndarray]],
+        grid_result: GridResult,
     ) -> None:
+        self.initial_reconstruction = {
+            bi: (t.copy(), R.copy()) for bi, (t, R) in fitted.items()
+        }
         self.initial_brick_midpoints = {
             bi: t.copy() for bi, (t, _R) in fitted.items()
         }
+        self.initial_tag_ids_by_brick = {}
+        self.initial_layer_middle_brick_ids = {}
+        self.initial_layer_slot_brick_ids = {}
+        self.layer_push_states = []
+        for y in range(self.layer_count):
+            slot_ids: Dict[int, int] = {}
+            for slot_id in range(self.bricks_per_layer):
+                brick_id = self._grid_slot_brick_id(grid_result, y, slot_id)
+                if brick_id is None:
+                    continue
+                slot_ids[slot_id] = brick_id
+
+            if slot_ids:
+                self.initial_layer_slot_brick_ids[y] = slot_ids
+            mid_id = slot_ids.get(MIDDLE_BRICK_SLOT)
+            if mid_id is not None:
+                self.initial_layer_middle_brick_ids[y] = mid_id
+
+            axis_flag = 0 if layer_axis_is_y_aligned(grid_result.layers.get(y, [])) else 1
+            self.layer_push_states.append(
+                (
+                    axis_flag,
+                    slot_ids.get(0, EMPTY_BRICK_ID),
+                    slot_ids.get(1, EMPTY_BRICK_ID),
+                    slot_ids.get(2, EMPTY_BRICK_ID),
+                )
+            )
         self.gone_brick_ids.clear()
         self.last_brick_count = len(self.initial_brick_midpoints)
 
-    def _gone_bricks_from_initial(
-        self, fitted: Dict[int, Tuple[np.ndarray, np.ndarray]]
-    ) -> set[int]:
-        gone = set(self.gone_brick_ids)
-        for bi, initial_t in self.initial_brick_midpoints.items():
-            current = fitted.get(bi)
-            if current is None:
-                gone.add(bi)
+    @staticmethod
+    def _grid_slot_brick_id(
+        grid_result: GridResult, layer_id: int, slot_id: int
+    ) -> Optional[int]:
+        for (sx, sy, _sz), brick_id in grid_result.grid.items():
+            if sx == slot_id and sy == layer_id:
+                return brick_id
+        return None
+
+    def _layer_state(self, layer_id: int) -> LayerState:
+        if 0 <= layer_id < len(self.layer_push_states):
+            return self.layer_push_states[layer_id]
+        return 1, EMPTY_BRICK_ID, EMPTY_BRICK_ID, EMPTY_BRICK_ID
+
+    @staticmethod
+    def _layer_axis_flag(state: LayerState) -> int:
+        return int(state[0])
+
+    @staticmethod
+    def _layer_slots(state: LayerState) -> Tuple[int, int, int]:
+        return state[1], state[2], state[3]
+
+    @staticmethod
+    def _reverse_layer_slots(slots: Tuple[int, int, int]) -> Tuple[int, int, int]:
+        return slots[2], slots[1], slots[0]
+
+    @staticmethod
+    def _layer_push_mask(state: LayerState) -> int:
+        mask = 0
+        for slot_id, brick_id in enumerate(state[1:]):
+            if brick_id != EMPTY_BRICK_ID:
+                mask |= 1 << slot_id
+        return mask
+
+    @staticmethod
+    def _layer_active_count(state: LayerState) -> int:
+        return sum(1 for brick_id in state[1:] if brick_id != EMPTY_BRICK_ID)
+
+    def _layer_auto_push_candidate(self, layer_id: int) -> Tuple[bool, str]:
+        state = self._layer_state(layer_id)
+        slots = self._layer_slots(state)
+
+        if self._layer_active_count(state) == 0:
+            return False, "no bricks left in cached layer state"
+        if slots[MIDDLE_BRICK_SLOT] == EMPTY_BRICK_ID:
+            return False, f"middle brick is gone in cached layer state {state}"
+        if slots[0] == EMPTY_BRICK_ID and slots[2] == EMPTY_BRICK_ID:
+            return False, f"only middle brick remains in cached layer state {state}"
+
+        return True, ""
+
+    def _update_layer_push_states_from_gone(self) -> None:
+        states: List[LayerState] = []
+        for layer_id in range(self.layer_count):
+            state = self._layer_state(layer_id)
+            axis_flag = self._layer_axis_flag(state)
+            slots = [
+                brick_id if brick_id not in self.gone_brick_ids else EMPTY_BRICK_ID
+                for brick_id in self._layer_slots(state)
+            ]
+            states.append((axis_flag, slots[0], slots[1], slots[2]))
+        self.layer_push_states = states
+
+    def _toggle_layer_axes_after_z_rotation(self) -> None:
+        if not self.layer_push_states:
+            return
+        states: List[LayerState] = []
+        for state in self.layer_push_states:
+            axis_flag = self._layer_axis_flag(state)
+            slots = self._layer_slots(state)
+            new_axis_flag = axis_flag ^ 1
+            reverse_slots = axis_flag == 1 and new_axis_flag == 0
+            if reverse_slots:
+                slots = self._reverse_layer_slots(slots)
+            states.append((new_axis_flag, slots[0], slots[1], slots[2]))
+        self.layer_push_states = states
+
+    def _brick_index_from_tag_id(self, tag_id: int) -> Optional[int]:
+        if not is_block_tag_id(tag_id, self.recon_cfg):
+            return None
+        brick_id = (int(tag_id) - int(self.recon_cfg.start_id)) // 10
+        if brick_id not in self.initial_brick_midpoints:
+            return None
+        return brick_id
+
+    def _visible_initial_tags_by_brick(
+        self, require_recorded_initial_tag: bool = True
+    ) -> Dict[int, set[int]]:
+        """Return visible initial tag ids grouped by brick, filtered by world z > 0."""
+        visible: Dict[int, set[int]] = {}
+        for st in self.cam_states:
+            with st.lock:
+                frame_bgr = (
+                    None if st.latest_frame_bgr is None else st.latest_frame_bgr.copy()
+                )
+                p = None if st.stored_p is None else st.stored_p.copy()
+                R = None if st.stored_R is None else st.stored_R.copy()
+                K = st.K.copy()
+
+            if frame_bgr is None or p is None or R is None:
                 continue
-            current_t, _R = current
-            if np.linalg.norm(current_t - initial_t) >= BRICK_GONE_DISTANCE:
-                gone.add(bi)
-        return gone
+
+            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+            dets = detect_apriltags_silent(
+                self.recon_detector,
+                gray,
+                estimate_tag_pose=True,
+                camera_params=(
+                    float(K[0, 0]),
+                    float(K[1, 1]),
+                    float(K[0, 2]),
+                    float(K[1, 2]),
+                ),
+                tag_size=float(self.recon_cfg.tag_size),
+            )
+            for det in dets:
+                tid = int(getattr(det, "tag_id", -1))
+                brick_id = self._brick_index_from_tag_id(tid)
+                if brick_id is None:
+                    continue
+                if require_recorded_initial_tag:
+                    recorded = self.initial_tag_ids_by_brick.get(brick_id, set())
+                    if tid not in recorded:
+                        continue
+
+                pose = get_pupil_pose(det)
+                if pose is None:
+                    continue
+                _R_c_t, t_c_t = pose
+                p_est_w = cv_point_to_world(
+                    t_c_t,
+                    self.recon_cfg.S_cv2mj,
+                    R,
+                    p,
+                )
+                if float(p_est_w[2] * self.scale) > 0.0:
+                    visible.setdefault(brick_id, set()).add(tid)
+
+        return visible
+
+    def _record_initial_visible_tags(self) -> None:
+        self.initial_tag_ids_by_brick = self._visible_initial_tags_by_brick(
+            require_recorded_initial_tag=False
+        )
+
+    def _visible_bricks_from_current_tags(self) -> set[int]:
+        """Return bricks with any initially recorded tag visible at world z > 0."""
+        visible_tags = self._visible_initial_tags_by_brick(
+            require_recorded_initial_tag=True
+        )
+        return {brick_id for brick_id, tag_ids in visible_tags.items() if tag_ids}
+
+    def _gone_bricks_from_current_visibility(self) -> set[int]:
+        visible = self._visible_bricks_from_current_tags()
+        return set(self.initial_brick_midpoints) - visible
 
     def _active_fitted(
         self,
-        fitted: Dict[int, Tuple[np.ndarray, np.ndarray]],
+        fitted: Optional[Dict[int, Tuple[np.ndarray, np.ndarray]]] = None,
         gone_ids: Optional[set[int]] = None,
     ) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
         if not self.initial_brick_midpoints:
-            return fitted
+            return {} if fitted is None else fitted
+        if fitted is None:
+            fitted = self.initial_reconstruction
         if gone_ids is None:
-            gone_ids = self._gone_bricks_from_initial(fitted)
+            gone_ids = self._gone_bricks_from_current_visibility()
         return {
             bi: pose
             for bi, pose in fitted.items()
@@ -595,8 +835,8 @@ class JengaController:
 
     def _set_gone_bricks(
         self,
-        fitted: Dict[int, Tuple[np.ndarray, np.ndarray]],
         gone_ids: set[int],
+        fitted: Optional[Dict[int, Tuple[np.ndarray, np.ndarray]]] = None,
     ) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
         self.gone_brick_ids = set(gone_ids)
         active = self._active_fitted(fitted, self.gone_brick_ids)
@@ -605,7 +845,52 @@ class JengaController:
         )
         self.last_reconstruction = active
         self.last_grid = bricks_to_grid(active, self.layer_count, self.bricks_per_layer)
+        self._update_layer_push_states_from_gone()
         return active
+
+    def _update_gone_from_visibility(
+        self, phase_label: Optional[str] = None
+    ) -> Tuple[set[int], set[int], set[int], Dict[int, Tuple[np.ndarray, np.ndarray]]]:
+        gone_ids = self._gone_bricks_from_current_visibility()
+        newly_gone = gone_ids - self.gone_brick_ids
+        restored = self.gone_brick_ids - gone_ids
+        active = self._set_gone_bricks(gone_ids)
+        if self.xy_log:
+            self._print_xy_log(phase_label)
+
+        if phase_label is not None:
+            if newly_gone:
+                print(
+                    f"{phase_label} Visibility update marked gone brick id(s): "
+                    f"{sorted(newly_gone)}."
+                )
+            if restored:
+                print(
+                    f"{phase_label} Visibility update marked visible brick id(s): "
+                    f"{sorted(restored)}."
+                )
+            if not newly_gone and not restored:
+                print(f"{phase_label} Visibility update: no brick-state changes.")
+
+        return gone_ids, newly_gone, restored, active
+
+    def _print_xy_log(self, phase_label: Optional[str] = None) -> None:
+        prefix = f"{phase_label} " if phase_label else ""
+        tuples = ", ".join(str(state) for state in self.layer_push_states)
+        print(f"{prefix}XY layer states: [{tuples}]")
+
+    def _refresh_tower_from_vision(
+        self, phase_label: str
+    ) -> Tuple[
+        Dict[int, Tuple[np.ndarray, np.ndarray]],
+        set[int],
+        Dict[int, Tuple[np.ndarray, np.ndarray]],
+        GridResult,
+    ]:
+        gone_ids, _newly_gone, _restored, active = self._update_gone_from_visibility(
+            phase_label
+        )
+        return self.last_reconstruction, gone_ids, active, self.last_grid
 
     def _enter_wait(self) -> None:
         self.player_wait_started_at = time.monotonic()
@@ -616,25 +901,30 @@ class JengaController:
         self.game_outcome = outcome
         self.phase = Phase.COLLAPSE
 
-    def _handle_successful_robot_push(self, phase_label: str) -> bool:
-        """Return False if the robot push removed too many bricks and loses."""
+    def _handle_successful_robot_push(
+        self, phase_label: str, require_removed: bool = False
+    ) -> bool:
+        """Update from vision and return whether the push result is acceptable."""
         time.sleep(0.5)
-        fitted = self._reconstruct()
-        gone_ids = self._gone_bricks_from_initial(fitted)
-        newly_gone = gone_ids - self.gone_brick_ids
+        gone_ids, newly_gone, _restored, active = self._update_gone_from_visibility(
+            phase_label
+        )
 
         if len(newly_gone) >= 2:
-            active = self._set_gone_bricks(fitted, gone_ids)
             print(
-                f"{phase_label} Robot push moved {len(newly_gone)} bricks at least "
-                f"{BRICK_GONE_DISTANCE:g} units from their initial midpoints. "
+                f"{phase_label} Robot push made {len(newly_gone)} brick(s) gone "
+                "(no visible id with z > 0). "
                 f"Machine failed. Active bricks: {len(active)}."
             )
             self._end_game(GAME_LOSE)
             return False
 
-        if len(newly_gone) == 1:
-            self._set_gone_bricks(fitted, gone_ids)
+        if require_removed and not newly_gone:
+            print(
+                f"{phase_label} Tag visibility did not mark any new brick gone. "
+                "Treating this push as failed."
+            )
+            return False
 
         return True
 
@@ -686,6 +976,18 @@ class JengaController:
         )
 
     def _do_tower_init(self) -> None:
+        if not self.tower_init_y_raised:
+            print("[Phase TOWER_INIT] Moving Y up before tower reconstruction...")
+            self._send_and_wait("MOVE Y 10000", timeout=2.0, ignore_errors=True)
+            self._wait_for_done("Y")
+            self.tower_init_y_raised = True
+
+        if not self.tower_init_x_retracted:
+            print("[Phase TOWER_INIT] Retracting X before tower reconstruction...")
+            self._send_and_wait("MOVE X 10000", timeout=2.0, ignore_errors=True)
+            self._wait_for_done("X")
+            self.tower_init_x_retracted = True
+
         print("[Phase TOWER_INIT] Reconstructing tower...")
         fitted = self._reconstruct()
         count = len(fitted)
@@ -701,11 +1003,21 @@ class JengaController:
                 self.last_grid = bricks_to_grid(
                     fitted, self.layer_count, self.bricks_per_layer
                 )
-                self._record_initial_brick_midpoints(fitted)
+                self._record_initial_brick_midpoints(fitted, self.last_grid)
+                self._record_initial_visible_tags()
                 print(
                     f"[Phase TOWER_INIT] Recorded {len(self.initial_brick_midpoints)} "
-                    "initial brick midpoint(s)."
+                    "initial brick midpoint(s) and "
+                    f"{len(self.initial_layer_middle_brick_ids)} middle-brick id(s)."
                 )
+                print(
+                    "[Phase TOWER_INIT] Recorded initially visible tag id(s) for "
+                    f"{len(self.initial_tag_ids_by_brick)} brick(s)."
+                )
+                print("[Phase TOWER_INIT] Moving Y down after tower initialization...")
+                self._send_and_wait("MOVE Y -10000", timeout=2.0, ignore_errors=True)
+                self._wait_for_done("Y")
+                self.current_layer_id = 0
                 self._enter_wait()
                 return
         else:
@@ -726,31 +1038,26 @@ class JengaController:
             print("[Phase WAIT] Arduino A1 reads 0. Checking whether the player removed a brick...")
             self.player_wait_announced = False
 
-        fitted = self._reconstruct()
-        gone_ids = self._gone_bricks_from_initial(fitted)
-        newly_gone = gone_ids - self.gone_brick_ids
+        gone_ids, newly_gone, _restored, active = self._update_gone_from_visibility()
 
         if len(newly_gone) >= 2:
-            active = self._set_gone_bricks(fitted, gone_ids)
             print(
-                f"[Phase WAIT] Player moved {len(newly_gone)} bricks at least "
-                f"{BRICK_GONE_DISTANCE:g} units from their initial midpoints. "
+                f"[Phase WAIT] Player made {len(newly_gone)} brick(s) gone "
+                "(no visible id with z > 0). "
                 f"System wins. Active bricks: {len(active)}."
             )
             self._end_game(GAME_WIN)
             return
 
         if len(newly_gone) == 1:
-            active = self._set_gone_bricks(fitted, gone_ids)
             print(
-                f"[Phase WAIT] Brick removed by midpoint displacement. "
+                f"[Phase WAIT] Brick gone because no id is visible with z > 0. "
                 f"Active bricks: {len(active)}."
             )
             self._full_layer_search_start = FULL_LAYER_SEARCH_FIRST_LAYER
             self.phase = self.next_phase_after_wait
             return
 
-        active = self._active_fitted(fitted, gone_ids)
         if self._check_collapse(len(active)):
             print(f"[Phase WAIT] COLLAPSE detected. Active bricks: {len(active)}")
             self._end_game(GAME_LOSE)
@@ -761,44 +1068,76 @@ class JengaController:
         time.sleep(0.5)
 
     def _do_full_layer_1(self) -> None:
-        print("[Phase FULL_LAYER_1] Mapping grid...")
-        fitted = self._reconstruct()
-        gone_ids = self._gone_bricks_from_initial(fitted)
-        active = self._active_fitted(fitted, gone_ids)
-        grid_result = bricks_to_grid(active, self.layer_count, self.bricks_per_layer)
-        self.last_grid = grid_result
-
-        if self._check_collapse(grid_result.total):
-            print(f"[Phase FULL_LAYER_1] COLLAPSE. Active bricks: {grid_result.total}")
+        print("[Phase FULL_LAYER_1] Selecting AUTO_PUSH layer from cached state...")
+        active_count = sum(
+            self._layer_active_count(state) for state in self.layer_push_states
+        )
+        if self._check_collapse(active_count):
+            print(f"[Phase FULL_LAYER_1] COLLAPSE. Active bricks: {active_count}")
             self._end_game(GAME_LOSE)
             return
 
-        # Find a full layer (occupancy "111") in sequential order. A new robot
-        # turn starts from layer 1; retries continue upward from the last target.
+        # Find an AUTO_PUSH layer in sequential order. A cached layer is eligible
+        # when the middle brick and at least one side brick are still present.
         target_layer: Optional[int] = None
         search_start = max(
             FULL_LAYER_SEARCH_FIRST_LAYER,
             min(self._full_layer_search_start, self.layer_count),
         )
         for y in range(search_start, self.layer_count):
-            if grid_result.occupancy.get(y) == "111":
+            can_push, reason = self._layer_auto_push_candidate(y)
+            if can_push:
                 target_layer = y
                 break
+            state = self._layer_state(y)
+            if self._layer_active_count(state):
+                print(f"[Phase FULL_LAYER_1] Skipping layer {y}: {reason}.")
 
         if target_layer is None:
-            print("[Phase FULL_LAYER_1] No full layer found. Switching to LASTLY.")
-            self.next_phase_after_wait = Phase.LASTLY
+            print(
+                "[Phase FULL_LAYER_1] No layer with middle plus side brick "
+                "found. Randomly choosing a brick to move."
+            )
             self._full_layer_search_start = FULL_LAYER_SEARCH_FIRST_LAYER
-            self._enter_wait()
+            if self._try_random_cached_brick("[Phase FULL_LAYER_1 random]"):
+                print("[Phase FULL_LAYER_1] Random push succeeded. Checking tower state.")
+                if not self._handle_successful_robot_push(
+                    "[Phase FULL_LAYER_1 random]", require_removed=True
+                ):
+                    if self.phase == Phase.COLLAPSE:
+                        return
+                    print("[Phase FULL_LAYER_1] Random push not confirmed by vision. Retrying.")
+                    time.sleep(0.5)
+                    return
+                self._enter_wait()
+                return
+            print("[Phase FULL_LAYER_1] Random push failed. Retrying.")
+            time.sleep(0.5)
             return
 
-        layer = grid_result.layers.get(target_layer, [])
-        if layer_axis_is_y_aligned(layer):
-            print(f"[Phase FULL_LAYER_1] Layer {target_layer} is accessible. Running AUTO_PUSH.")
+        can_push, reason = self._layer_auto_push_candidate(target_layer)
+        if not can_push:
+            print(
+                f"[Phase FULL_LAYER_1] Skipping layer {target_layer} before AUTO_PUSH: "
+                f"{reason}."
+            )
+            self._full_layer_search_start = target_layer + 1
+            time.sleep(0.5)
+            return
+
+        state = self._layer_state(target_layer)
+        push_mask = self._layer_push_mask(state)
+        axis_flag = self._layer_axis_flag(state)
+        if axis_flag == 0:
+            print(
+                f"[Phase FULL_LAYER_1] Layer {target_layer} is accessible. "
+                f"Running AUTO_PUSH {push_mask:#05b} from state {state}."
+            )
         else:
             print(
-                f"[Phase FULL_LAYER_1] Layer {target_layer} is full but not accessible "
-                "(axis is not +Y/-Y). Rotating tower before AUTO_PUSH."
+                f"[Phase FULL_LAYER_1] Layer {target_layer} has state "
+                f"{state} but cached axis is X. Rotating tower before "
+                "AUTO_PUSH."
             )
             try:
                 self._rotate_z_with_x_retract(1)
@@ -807,13 +1146,32 @@ class JengaController:
                 self._full_layer_search_start = target_layer + 1
                 time.sleep(0.5)
                 return
+            print("[Phase FULL_LAYER_1] DONE Z received. Using cached layer state.")
+
+        can_push, reason = self._layer_auto_push_candidate(target_layer)
+        if not can_push:
             print(
-                f"[Phase FULL_LAYER_1] DONE Z received. Running AUTO_PUSH on layer {target_layer}."
+                f"[Phase FULL_LAYER_1] Skipping AUTO_PUSH on layer {target_layer}: "
+                f"{reason}."
             )
+            self._full_layer_search_start = target_layer + 1
+            time.sleep(0.5)
+            return
+
+        state = self._layer_state(target_layer)
+        push_mask = self._layer_push_mask(state)
+        axis_flag = self._layer_axis_flag(state)
+        if axis_flag != 0:
+            print(
+                f"[Phase FULL_LAYER_1] Layer {target_layer} is still cached as "
+                "inaccessible after rotation. Retrying another layer."
+            )
+            self._full_layer_search_start = target_layer + 1
+            time.sleep(0.5)
+            return
 
         try:
-            self._move_to_layer(target_layer)
-            self._run_auto_push()
+            self._run_auto_push(target_layer, push_mask)
         except (RuntimeError, TimeoutError) as exc:
             print(
                 f"[Phase FULL_LAYER_1] AUTO_PUSH failed on layer {target_layer}: {exc}. "
@@ -824,66 +1182,79 @@ class JengaController:
             return
 
         print("[Phase FULL_LAYER_1] AUTO_PUSH succeeded. Checking tower state.")
-        if not self._handle_successful_robot_push("[Phase FULL_LAYER_1]"):
+        if not self._handle_successful_robot_push(
+            "[Phase FULL_LAYER_1]", require_removed=True
+        ):
+            if self.phase == Phase.COLLAPSE:
+                return
+            print(
+                f"[Phase FULL_LAYER_1] AUTO_PUSH on layer {target_layer} was not "
+                "confirmed by tag visibility. Retrying another layer."
+            )
+            self._full_layer_search_start = target_layer + 1
+            time.sleep(0.5)
             return
         print("[Phase FULL_LAYER_1] Jumping to next phase.")
         self._full_layer_search_start = FULL_LAYER_SEARCH_FIRST_LAYER
         self._enter_wait()
 
-    def _try_push_layer(
-        self, layer: List[Tuple[int, np.ndarray, np.ndarray]], target_y: int
-    ) -> bool:
-        """Attempt to push one brick from the given layer. Returns True on success."""
-        if not layer:
+    def _try_random_cached_brick(self, phase_label: str) -> bool:
+        candidates: List[int] = []
+        for y in range(0, self.layer_count):
+            state = self._layer_state(y)
+            if self._layer_active_count(state):
+                candidates.append(y)
+
+        if not candidates:
+            print(f"{phase_label} No cached bricks remain.")
+            self._end_game(GAME_LOSE)
             return False
 
-        # Check orientation
-        if not layer_faces_pushrod(layer):
-            print(f"  Layer {target_y} not facing pushrod. Rotating Z...")
-            self._rotate_z_with_x_retract(1)
-            # Reconstruct after rotation
-            fitted = self._reconstruct()
-            gone_ids = self._gone_bricks_from_initial(fitted)
-            active = self._active_fitted(fitted, gone_ids)
-            grid_result = bricks_to_grid(active, self.layer_count, self.bricks_per_layer)
-            layer = grid_result.layers.get(target_y, [])
-            if not layer_faces_pushrod(layer):
-                print(f"  Layer {target_y} still not facing after rotation. Skip.")
-                return False
-
-        # Select brick: prefer middle (x=1) to avoid side instability,
-        # but any present brick is valid for a full layer.
-        for bi, t, R in layer:
-            # Find slot index for this brick
-            slot = None
-            for (sx, sy, sz), idx in self.last_grid.grid.items():
-                if idx == bi and sy == target_y:
-                    slot = sx
-                    break
-            if slot is None:
-                # Fallback: use position order within layer
-                slot = layer.index((bi, t, R))
-
-            print(f"  Pushing brick {bi} at layer={target_y} slot={slot}")
+        target_y = random.choice(candidates)
+        state = self._layer_state(target_y)
+        axis_flag = self._layer_axis_flag(state)
+        if axis_flag != 0:
+            print(f"{phase_label} Layer {target_y} is cached as X-axis. Rotating first.")
             try:
-                self._execute_push(slot, target_y)
+                self._rotate_z_with_x_retract(1)
             except (RuntimeError, TimeoutError) as exc:
-                print(f"  Push error: {exc}")
-                continue
+                print(f"{phase_label} Rotation failed: {exc}")
+                return False
+            state = self._layer_state(target_y)
+            axis_flag = self._layer_axis_flag(state)
 
-            # Verify by reconstruction
-            time.sleep(0.5)
-            post_fitted = self._reconstruct()
-            post_gone_ids = self._gone_bricks_from_initial(post_fitted)
-            if bi in post_gone_ids:
-                print(
-                    f"  Brick {bi} confirmed gone by midpoint displacement "
-                    f">= {BRICK_GONE_DISTANCE:g}."
-                )
-                return True
-            else:
-                print(f"  Brick {bi} has not moved far enough. Trying next.")
+        if axis_flag != 0:
+            print(f"{phase_label} Layer {target_y} is still not accessible.")
+            return False
 
+        slots_state = self._layer_slots(state)
+        slots = [
+            slot_id
+            for slot_id in range(self.bricks_per_layer)
+            if slots_state[slot_id] != EMPTY_BRICK_ID
+        ]
+        if not slots:
+            print(f"{phase_label} Layer {target_y} has no cached bricks left.")
+            return False
+
+        target_x = random.choice(slots)
+        brick_id = slots_state[target_x]
+        print(
+            f"{phase_label} Randomly pushing layer {target_y}, slot {target_x} "
+            f"(brick {brick_id})."
+        )
+        try:
+            self._execute_push(target_x, target_y)
+        except (RuntimeError, TimeoutError) as exc:
+            print(f"{phase_label} Random push error: {exc}")
+            return False
+
+        time.sleep(0.5)
+        post_gone_ids = self._gone_bricks_from_current_visibility()
+        if brick_id is None or brick_id in post_gone_ids:
+            return True
+
+        print(f"{phase_label} Brick {brick_id} still has a visible id with z > 0.")
         return False
 
     def _execute_push(self, target_x: int, target_y: int) -> None:
@@ -910,58 +1281,27 @@ class JengaController:
         self.current_layer_id = 0
 
     def _do_lastly(self) -> None:
-        print("[Phase LASTLY] Mapping grid...")
-        fitted = self._reconstruct()
-        gone_ids = self._gone_bricks_from_initial(fitted)
-        active = self._active_fitted(fitted, gone_ids)
-        grid_result = bricks_to_grid(active, self.layer_count, self.bricks_per_layer)
-        self.last_grid = grid_result
+        print("[Phase LASTLY] Updating cached grid from tag visibility...")
+        _gone_ids, _newly_gone, _restored, _active = self._update_gone_from_visibility()
+        grid_result = self.last_grid
 
         if self._check_collapse(grid_result.total):
             print(f"[Phase LASTLY] COLLAPSE. Active bricks: {grid_result.total}")
             self._end_game(GAME_LOSE)
             return
 
-        # Search for "110" or "011" patterns from the bottom layer upward.
-        candidates: List[Tuple[int, int]] = []  # (y, x_to_push)
-        for y in range(0, self.layer_count):
-            occ = grid_result.occupancy.get(y, "")
-            if occ == "110":
-                candidates.append((y, 1))  # push middle brick (x=1) which is at side
-            elif occ == "011":
-                candidates.append((y, 1))  # push middle brick (x=1) which is at side
-
-        if not candidates:
-            # Random selection from any existing brick.
-            all_bricks: List[Tuple[int, int]] = []
-            for y in range(0, self.layer_count):
-                layer = grid_result.layers.get(y, [])
-                for bi, _t, _R in layer:
-                    for (sx, sy, sz), idx in grid_result.grid.items():
-                        if idx == bi and sy == y:
-                            all_bricks.append((y, sx))
-                            break
-            if all_bricks:
-                candidates = [random.choice(all_bricks)]
-
-        if not candidates:
-            print("[Phase LASTLY] No bricks found. Halting.")
-            self._end_game(GAME_LOSE)
-            return
-
-        target_y, target_x = candidates[0]
-        layer = grid_result.layers.get(target_y, [])
-        pushed = self._try_push_layer(layer, target_y)
+        pushed = self._try_random_cached_brick("[Phase LASTLY random]")
 
         if pushed:
             print("[Phase LASTLY] Push succeeded. Checking tower state.")
-            if not self._handle_successful_robot_push("[Phase LASTLY]"):
+            if not self._handle_successful_robot_push(
+                "[Phase LASTLY]", require_removed=True
+            ):
                 return
-            print("[Phase LASTLY] Returning to WAIT.")
             self._enter_wait()
-        else:
-            print("[Phase LASTLY] Push failed. Retrying.")
-            time.sleep(0.5)
+            return
+        print("[Phase LASTLY] Push failed. Retrying.")
+        time.sleep(0.5)
 
     def _do_collapse(self) -> None:
         print("[Phase COLLAPSE] HALTING ALL MOTION")
@@ -1124,6 +1464,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Show a live MuJoCo viewer with the real-time reconstructed tower model.",
     )
+    ap.add_argument(
+        "--xy-log",
+        action="store_true",
+        help="Print cached (x, y) layer tuples after every tag visibility check.",
+    )
     ap.add_argument("--xml", default="assets/scene_turntable_only_lowlookat.xml")
     ap.add_argument("--fovy", type=float, default=100.0)
     ap.add_argument("--width", type=int, default=1920)
@@ -1280,6 +1625,7 @@ def main() -> int:
         live_lookat=t_w_g.copy(),
         calibration_locked=args.bypass_calib,
         bypass_calib=args.bypass_calib,
+        xy_log=args.xy_log,
     )
 
     try:
