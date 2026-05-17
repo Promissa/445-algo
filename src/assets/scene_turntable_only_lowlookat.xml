@@ -1,0 +1,40 @@
+<mujoco model="blocks_from_file">
+  <option timestep="0.002" gravity="0 0 -9.81"/>
+  <default>
+    <geom friction="0.600000 0.005 0.0001" solimp="0.9 0.95 0.001" solref="0.01 1"/>
+  </default>
+  <visual> <global offwidth="3840" offheight="1440"/>  <quality shadowsize="0"/> </visual>
+  <asset>
+    <mesh name="tag_plate_0p8" file="tag_plate_0p8.obj"/>
+    <texture name="tex_296" type="2d" file="textures/textures/tag36_11_00296.png"/>
+    <material name="mat_296" texture="tex_296" rgba="1 1 1 1" specular="0" shininess="0" texrepeat="1 1" texuniform="true"/>
+    <texture name="tex_297" type="2d" file="textures/textures/tag36_11_00297.png"/>
+    <material name="mat_297" texture="tex_297" rgba="1 1 1 1" specular="0" shininess="0" texrepeat="1 1" texuniform="true"/>
+    <texture name="tex_298" type="2d" file="textures/textures/tag36_11_00298.png"/>
+    <material name="mat_298" texture="tex_298" rgba="1 1 1 1" specular="0" shininess="0" texrepeat="1 1" texuniform="true"/>
+    <texture name="tex_299" type="2d" file="textures/textures/tag36_11_00299.png"/>
+    <material name="mat_299" texture="tex_299" rgba="1 1 1 1" specular="0" shininess="0" texrepeat="1 1" texuniform="true"/>
+  </asset>
+  <worldbody>
+    <camera name="cam0" pos="6.0 0.0 4.0" quat="0.6189979158661568 0.3418209767602837 0.3418209767602837 0.6189979158661567" fovy="90.0"/>
+    <camera name="cam1" pos="-6.0 0.0 4.0" quat="0.6189979158661568 0.3418209767602837 -0.3418209767602837 -0.6189979158661567" fovy="90.0"/>
+    <camera name="cam2" pos="0.0 6.0 4.0" quat="-0.0 0.0 0.48340786123801177 0.8753952476985989" fovy="90.0"/>
+    <camera name="cam3" pos="0.0 -6.0 4.0" quat="0.8753952476985989 0.48340786123801177 -0.0 -0.0" fovy="90.0"/>
+    <light name="light_xy_pos" pos=" 6  0  10" dir="-1 -0 -1" directional="false" diffuse="0.5 0.5 0.5"/>
+    <light name="light_xy_neg" pos="-6 -0  10" dir=" 1  0 -1" directional="false" diffuse="0.5 0.5 0.5"/>
+    <light name="light_xny_pos" pos=" 0 -6  10" dir="-0  1 -1" directional="false" diffuse="0.4 0.4 0.4"/>
+    <light name="light_xny_neg" pos="-0  6  10" dir=" 0 -1 -1" directional="false" diffuse="0.4 0.4 0.4"/>
+    <geom name="floor" type="plane" size="8 8 0.1" rgba="0.2 0.2 0.2 1" friction="0.600000 0.005 0.0001"/>
+    <body name="turntable" pos="0 0 0.110000">
+      <geom name="turntable_geom" type="cylinder" size="1.900000 0.110000" rgba="0.16 0.18 0.22 1" mass="12.000000" friction="0.600000 0.005 0.0001"/>
+      <geom name="turntable_top_marker" type="cylinder" size="0.608000 0.002500" pos="0 0 0.107500" rgba="0.75 0.25 0.2 1" contype="0" conaffinity="0"/>
+      <site name="turntable_top_center" pos="0 0 0.110000" size="0.02" rgba="0.2 0.8 1 1"/>
+      <geom name="tt_296" type="mesh" mesh="tag_plate_0p8" material="mat_296" pos="-1.000000 -1.000000 0.114000" quat="1 0 0 0" contype="0" conaffinity="0" rgba="1 1 1 1"/>
+      <geom name="tt_297" type="mesh" mesh="tag_plate_0p8" material="mat_297" pos="1.000000 -1.000000 0.114000" quat="1 0 0 0" contype="0" conaffinity="0" rgba="1 1 1 1"/>
+      <geom name="tt_298" type="mesh" mesh="tag_plate_0p8" material="mat_298" pos="1.000000 1.000000 0.114000" quat="1 0 0 0" contype="0" conaffinity="0" rgba="1 1 1 1"/>
+      <geom name="tt_299" type="mesh" mesh="tag_plate_0p8" material="mat_299" pos="-1.000000 1.000000 0.114000" quat="1 0 0 0" contype="0" conaffinity="0" rgba="1 1 1 1"/>
+    </body>
+  </worldbody>
+  <actuator>
+  </actuator>
+</mujoco>

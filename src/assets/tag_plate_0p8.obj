@@ -1,0 +1,40 @@
+o tag_plate_0p8
+# size: 0.8 x 0.8 x 0.0002 (half: 0.4, 0.4, 0.0001)
+# Front face (z=+0.001) has UV (0..1)
+v -0.4 -0.4  0.0001
+v  0.4 -0.4  0.0001
+v  0.4  0.4  0.0001
+v -0.4  0.4  0.0001
+
+# Back face (z=-0.0001)
+v -0.4 -0.4 -0.0001
+v  0.4 -0.4 -0.0001
+v  0.4  0.4 -0.0001
+v -0.4  0.4 -0.0001
+
+# UVs for front
+vt 0 0
+vt 1 0
+vt 1 1
+vt 0 1
+
+# Front face (two triangles) with UV
+f 1/1 2/2 3/3
+f 1/1 3/3 4/4
+
+# Back face (no UV needed; still triangulate)
+f 8 7 6
+f 8 6 5
+
+# Sides (4 faces, 8 triangles)
+f 1 5 6
+f 1 6 2
+
+f 2 6 7
+f 2 7 3
+
+f 3 7 8
+f 3 8 4
+
+f 4 8 5
+f 4 5 1
