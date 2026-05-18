@@ -380,6 +380,7 @@ class JengaController:
     current_layer_id: int = 0
     tower_init_y_raised: bool = False
     tower_init_x_retracted: bool = False
+    na_layer: List[int] = field(default_factory=list)
 
     # Push parameters
     push_dc_duty: int = DEFAULT_PUSH_DC_DUTY
@@ -507,6 +508,7 @@ class JengaController:
 
     def _run_auto_push(self, target_layer: int, push_mask: int) -> None:
         self._move_to_layer(target_layer)
+        print(push_mask)
         if (push_mask == 6):
             self.arduino.send("AUTO_PUSH 4")
         elif (push_mask == 3):
@@ -723,6 +725,14 @@ class JengaController:
 
         return True, ""
 
+    def _mark_na_layer(self, layer_id: int, reason: str) -> None:
+        if layer_id not in self.na_layer:
+            self.na_layer.append(layer_id)
+        print(
+            f"[Phase FULL_LAYER_1] Marked layer {layer_id} as not applicable: "
+            f"{reason}. na_layer={self.na_layer}"
+        )
+
     def _update_layer_push_states_from_gone(self) -> None:
         states: List[LayerState] = []
         for layer_id in range(self.layer_count):
@@ -743,7 +753,7 @@ class JengaController:
             axis_flag = self._layer_axis_flag(state)
             slots = self._layer_slots(state)
             new_axis_flag = axis_flag ^ 1
-            reverse_slots = axis_flag == 1 and new_axis_flag == 0
+            reverse_slots = axis_flag == 0 and new_axis_flag == 1
             if reverse_slots:
                 slots = self._reverse_layer_slots(slots)
             states.append((new_axis_flag, slots[0], slots[1], slots[2]))
@@ -1069,6 +1079,7 @@ class JengaController:
                 f"Active bricks: {len(active)}."
             )
             self._full_layer_search_start = FULL_LAYER_SEARCH_FIRST_LAYER
+            self.na_layer.clear()
             self.phase = self.next_phase_after_wait
             return
 
@@ -1099,6 +1110,9 @@ class JengaController:
             min(self._full_layer_search_start, self.layer_count),
         )
         for y in range(search_start, self.layer_count):
+            if y in self.na_layer:
+                print(f"[Phase FULL_LAYER_1] Skipping layer {y}: in na_layer.")
+                continue
             can_push, reason = self._layer_auto_push_candidate(y)
             if can_push:
                 target_layer = y
@@ -1108,24 +1122,36 @@ class JengaController:
                 print(f"[Phase FULL_LAYER_1] Skipping layer {y}: {reason}.")
 
         if target_layer is None:
-            print(
-                "[Phase FULL_LAYER_1] No layer with middle plus side brick "
-                "found. Randomly choosing a brick to move."
-            )
-            self._full_layer_search_start = FULL_LAYER_SEARCH_FIRST_LAYER
-            if self._try_random_cached_brick("[Phase FULL_LAYER_1 random]"):
-                print("[Phase FULL_LAYER_1] Random push succeeded. Checking tower state.")
-                if not self._handle_successful_robot_push(
-                    "[Phase FULL_LAYER_1 random]", require_removed=True
-                ):
-                    if self.phase == Phase.COLLAPSE:
+            if self.na_layer:
+                print(
+                    "[Phase FULL_LAYER_1] All available layers in this pass were "
+                    f"not applicable. Clearing na_layer {self.na_layer} and "
+                    "retrying from bottom."
+                )
+                self.na_layer.clear()
+                self._full_layer_search_start = FULL_LAYER_SEARCH_FIRST_LAYER
+            else:
+                print(
+                    "[Phase FULL_LAYER_1] No layer with middle plus side brick "
+                    "found. Randomly choosing a brick to move."
+                )
+                self._full_layer_search_start = FULL_LAYER_SEARCH_FIRST_LAYER
+                if self._try_random_cached_brick("[Phase FULL_LAYER_1 random]"):
+                    print("[Phase FULL_LAYER_1] Random push succeeded. Checking tower state.")
+                    if not self._handle_successful_robot_push(
+                        "[Phase FULL_LAYER_1 random]", require_removed=True
+                    ):
+                        if self.phase == Phase.COLLAPSE:
+                            return
+                        print(
+                            "[Phase FULL_LAYER_1] Random push not confirmed by vision. "
+                            "Retrying."
+                        )
+                        time.sleep(0.5)
                         return
-                    print("[Phase FULL_LAYER_1] Random push not confirmed by vision. Retrying.")
-                    time.sleep(0.5)
+                    self._enter_wait()
                     return
-                self._enter_wait()
-                return
-            print("[Phase FULL_LAYER_1] Random push failed. Retrying.")
+                print("[Phase FULL_LAYER_1] Random push failed. Retrying.")
             time.sleep(0.5)
             return
 
@@ -1135,6 +1161,7 @@ class JengaController:
                 f"[Phase FULL_LAYER_1] Skipping layer {target_layer} before AUTO_PUSH: "
                 f"{reason}."
             )
+            self._mark_na_layer(target_layer, reason)
             self._full_layer_search_start = target_layer + 1
             time.sleep(0.5)
             return
@@ -1157,6 +1184,7 @@ class JengaController:
                 self._rotate_z_with_x_retract(1)
             except (RuntimeError, TimeoutError) as exc:
                 print(f"[Phase FULL_LAYER_1] Rotation failed: {exc}")
+                self._mark_na_layer(target_layer, f"rotation failed: {exc}")
                 self._full_layer_search_start = target_layer + 1
                 time.sleep(0.5)
                 return
@@ -1168,6 +1196,7 @@ class JengaController:
                 f"[Phase FULL_LAYER_1] Skipping AUTO_PUSH on layer {target_layer}: "
                 f"{reason}."
             )
+            self._mark_na_layer(target_layer, reason)
             self._full_layer_search_start = target_layer + 1
             time.sleep(0.5)
             return
@@ -1180,6 +1209,7 @@ class JengaController:
                 f"[Phase FULL_LAYER_1] Layer {target_layer} is still cached as "
                 "inaccessible after rotation. Retrying another layer."
             )
+            self._mark_na_layer(target_layer, "still inaccessible after rotation")
             self._full_layer_search_start = target_layer + 1
             time.sleep(0.5)
             return
@@ -1191,6 +1221,7 @@ class JengaController:
                 f"[Phase FULL_LAYER_1] AUTO_PUSH failed on layer {target_layer}: {exc}. "
                 "Retrying another layer."
             )
+            self._mark_na_layer(target_layer, f"AUTO_PUSH failed: {exc}")
             self._full_layer_search_start = target_layer + 1
             time.sleep(0.5)
             return
@@ -1205,11 +1236,15 @@ class JengaController:
                 f"[Phase FULL_LAYER_1] AUTO_PUSH on layer {target_layer} was not "
                 "confirmed by tag visibility. Retrying another layer."
             )
+            self._mark_na_layer(
+                target_layer, "AUTO_PUSH not confirmed by tag visibility"
+            )
             self._full_layer_search_start = target_layer + 1
             time.sleep(0.5)
             return
         print("[Phase FULL_LAYER_1] Jumping to next phase.")
         self._full_layer_search_start = FULL_LAYER_SEARCH_FIRST_LAYER
+        self.na_layer.clear()
         self._enter_wait()
 
     def _try_random_cached_brick(self, phase_label: str) -> bool:
