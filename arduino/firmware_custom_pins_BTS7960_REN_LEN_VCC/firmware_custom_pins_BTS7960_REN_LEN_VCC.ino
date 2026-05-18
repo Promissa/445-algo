@@ -37,8 +37,9 @@ Z(DEGREE) = (DEGREE / 90) * 400
     PING                       -> PONG
     STATUS?                    返回三轴位置 + DC 状态 + BUSY
     LIMITS?                    返回 4 路限位实时状态
+    A1?                        返回 analog pin A1 的实时读数
     INIT                       X/Y 回负限位，X 执行 BM X 2
-    AUTO_PUSH                  自动推送流程，结束后执行 MOVE X -10000 复位
+    AUTO_PUSH [mask]           自动推送流程，mask bit0/1/2 选择尝试位置
 
     MOVE X|Y|Z <steps> F <rate> [A <acc> | AU <up> AD <down>]
         steps  : 整数步数（带符号）
@@ -124,7 +125,7 @@ static const float    INIT_HOME_ACCEL  = 600.0f;
 static const long     INIT_X_OFFSET    = 420L;
 
 static const long     AUTO_PUSH_BM_X_STEPS = 638L;
-static const long     AUTO_PUSH_RESET_X_STEPS = -10000L;
+static const long     AUTO_PUSH_RESET_X_STEPS = 10000L;
 static const uint8_t  AUTO_PUSH_MAX_TRIES   = 3;
 static const uint32_t AUTO_PUSH_DC_2S_MS    = 2500UL;
 static const uint32_t AUTO_PUSH_DC_15S_MS   = 5000UL;
@@ -210,7 +211,11 @@ enum AutoPushState {
 static AutoPushState g_auto_push_state = AUTO_PUSH_IDLE;
 static uint32_t g_auto_push_stage_ms = 0;
 static uint8_t g_auto_push_tries = 0;
+static uint8_t g_auto_push_mask = 0x07;
+static uint8_t g_auto_push_slot = 0;
 static bool g_auto_push_done_max_after_reset = false;
+static bool g_auto_push_success_latched = false;
+static uint8_t g_auto_push_success_slot = 0;
 static volatile bool g_auto_push_ignore_x_pos_limit = false;
 static bool g_bm_z_done_pending = false;
 
@@ -420,6 +425,7 @@ static void request_stop_all(bool send_ok){
   }
   g_auto_push_state = AUTO_PUSH_IDLE;
   g_bm_z_done_pending = false;
+  g_auto_push_success_latched = false;
   // g_auto_push_ignore_x_pos_limit = false;
 
   noInterrupts();
@@ -436,6 +442,7 @@ static void emergency_stop_all(bool send_ok){
   g_init_state = INIT_IDLE;
   g_auto_push_state = AUTO_PUSH_IDLE;
   g_bm_z_done_pending = false;
+  g_auto_push_success_latched = false;
   // g_auto_push_ignore_x_pos_limit = false;
 
   noInterrupts();
@@ -563,22 +570,38 @@ static bool auto_push_start_x_home(){
   return start_move(&AXIS_X, -INIT_HOME_STEPS, INIT_HOME_RATE, INIT_HOME_ACCEL, INIT_HOME_ACCEL);
 }
 
+static void auto_push_print_success(){
+  Serial.print(F("AUTO PUSH SUCCESS "));
+  Serial.println(g_auto_push_success_slot);
+}
+
 static void auto_push_fail(const __FlashStringHelper* msg){
+  (void)msg;
   dc_stop();
   g_auto_push_state = AUTO_PUSH_IDLE;
   g_auto_push_done_max_after_reset = false;
+  if(g_auto_push_success_latched){
+    auto_push_print_success();
+    g_auto_push_success_latched = false;
+    return;
+  }
   // g_auto_push_ignore_x_pos_limit = false;
-  reply_err(msg);
+  Serial.println(F("WARN: AUTO_PUSH FAILED"));
 }
 
 static void auto_push_finish_after_reset(){
   g_auto_push_state = AUTO_PUSH_IDLE;
   // g_auto_push_ignore_x_pos_limit = false;
-  if(g_auto_push_done_max_after_reset){
+  if(g_auto_push_success_latched){
+    auto_push_print_success();
+    g_auto_push_success_latched = false;
     g_auto_push_done_max_after_reset = false;
-    Serial.println(F("AUTO_PUSH FAILED MAX"));
+  } else if(g_auto_push_done_max_after_reset){
+    g_auto_push_done_max_after_reset = false;
+    Serial.println(F("WARN: AUTO_PUSH FAILED"));
   } else {
-    Serial.println(F("AUTO_PUSH SUCCESS"));
+    g_auto_push_success_slot = g_auto_push_slot;
+    auto_push_print_success();
   }
 }
 
@@ -604,8 +627,18 @@ static void auto_push_done_max(){
   auto_push_start_reset(true);
 }
 
+static bool auto_push_find_selected_slot(uint8_t first_slot, uint8_t* slot_out){
+  for(uint8_t slot = first_slot; slot < AUTO_PUSH_MAX_TRIES; slot++){
+    if(g_auto_push_mask & (1 << slot)){
+      *slot_out = slot;
+      return true;
+    }
+  }
+  return false;
+}
+
 static void auto_push_start_probe(){
-  if(g_auto_push_tries >= AUTO_PUSH_MAX_TRIES){
+  if(g_auto_push_slot >= AUTO_PUSH_MAX_TRIES || !(g_auto_push_mask & (1 << g_auto_push_slot))){
     auto_push_done_max();
     return;
   }
@@ -615,7 +648,33 @@ static void auto_push_start_probe(){
   g_auto_push_state = AUTO_PUSH_DC_80;
 }
 
-static void auto_push(){
+static void auto_push_move_to_selected_slot(uint8_t next_slot){
+  if(next_slot >= AUTO_PUSH_MAX_TRIES){
+    auto_push_done_max();
+    return;
+  }
+
+  long delta_slots = (long)next_slot - (long)g_auto_push_slot;
+  g_auto_push_slot = next_slot;
+  if(delta_slots <= 0){
+    auto_push_start_probe();
+    return;
+  }
+
+  if(next_slot == (AUTO_PUSH_MAX_TRIES - 1) && limit_active(AXIS_X.pin_limit_pos)){
+    g_auto_push_state = AUTO_PUSH_BM_X;
+    return;
+  }
+
+  long steps = delta_slots * AUTO_PUSH_BM_X_STEPS;
+  if(!start_move(&AXIS_X, steps, INIT_HOME_RATE, INIT_HOME_ACCEL, INIT_HOME_ACCEL)){
+    auto_push_fail(F("auto_push_bm_failed"));
+    return;
+  }
+  g_auto_push_state = AUTO_PUSH_BM_X;
+}
+
+static void auto_push(uint8_t push_mask){
   if(g_auto_push_state != AUTO_PUSH_IDLE){
     reply_err(F("auto_push_busy"));
     return;
@@ -628,6 +687,11 @@ static void auto_push(){
     reply_err(F("busy"));
     return;
   }
+  push_mask &= 0x07;
+  if(push_mask == 0){
+    reply_err(F("auto_push_empty_mask"));
+    return;
+  }
 
   if(!auto_push_start_x_home()){
     reply_err(F("auto_push_home_start_failed"));
@@ -635,6 +699,11 @@ static void auto_push(){
   }
 
   g_auto_push_tries = 0;
+  g_auto_push_mask = push_mask;
+  g_auto_push_slot = 0;
+  g_auto_push_success_latched = false;
+  g_auto_push_success_slot = 0;
+  g_auto_push_done_max_after_reset = false;
   // g_auto_push_ignore_x_pos_limit = true;
   g_auto_push_state = AUTO_PUSH_HOME_X;
   reply_ok();
@@ -664,7 +733,12 @@ static void update_auto_push(){
   if(g_auto_push_state == AUTO_PUSH_X_OFFSET){
     if(axis_active(&AXIS_X)) return;
 
-    auto_push_start_probe();
+    uint8_t first_slot = 0;
+    if(!auto_push_find_selected_slot(0, &first_slot)){
+      auto_push_done_max();
+      return;
+    }
+    auto_push_move_to_selected_slot(first_slot);
     return;
   }
 
@@ -673,6 +747,8 @@ static void update_auto_push(){
       delay(10);
       if (analogRead(A0) == 0) {
         dc_stop();
+        Serial.print(F("AUTO_PUSH A0_GROUNDED "));
+        Serial.println(g_auto_push_slot);
         dc_set_speed(-180);
         g_auto_push_stage_ms = millis();
         g_auto_push_state = AUTO_PUSH_DC_NEG_80;
@@ -682,6 +758,8 @@ static void update_auto_push(){
 
     if(!elapsed_ms(g_auto_push_stage_ms, AUTO_PUSH_DC_2S_MS)) return;
 
+    g_auto_push_success_latched = true;
+    g_auto_push_success_slot = g_auto_push_slot;
     dc_set_speed(180);
     g_auto_push_stage_ms = millis();
     g_auto_push_state = AUTO_PUSH_DC_180;
@@ -692,12 +770,12 @@ static void update_auto_push(){
     if(!elapsed_ms(g_auto_push_stage_ms, AUTO_PUSH_DC_2S_MS)) return;
 
     dc_stop();
-    if(!start_move(&AXIS_X, AUTO_PUSH_BM_X_STEPS, INIT_HOME_RATE, INIT_HOME_ACCEL, INIT_HOME_ACCEL)){
-      auto_push_fail(F("auto_push_bm_failed"));
+    uint8_t next_slot = 0;
+    if(!auto_push_find_selected_slot(g_auto_push_slot + 1, &next_slot)){
+      auto_push_done_max();
       return;
     }
-
-    g_auto_push_state = AUTO_PUSH_BM_X;
+    auto_push_move_to_selected_slot(next_slot);
     return;
   }
 
@@ -926,7 +1004,7 @@ static void print_help(){
   Serial.println(F("=== Custom Board Motion Firmware HELP ==="));
   Serial.println(F("Steppers (3 axes, trapezoidal):"));
   Serial.println(F("  INIT  (homes X/Y, then runs BM X 2)"));
-  Serial.println(F("  AUTO_PUSH  (ends with MOVE X -10000 reset)"));
+  Serial.println(F("  AUTO_PUSH [mask]  (mask bit0/1/2 selects push slots)"));
   Serial.println(F("  MOVE X|Y|Z <steps> F <rate> [A <acc> | AU <up> AD <down>]"));
   Serial.println(F("  STOP   STOP!"));
   Serial.println(F("DC motor (BTS7960):"));
@@ -934,7 +1012,7 @@ static void print_help(){
   Serial.println(F("  DC R <0-255>   reverse"));
   Serial.println(F("  DC 0           stop"));
   Serial.println(F("Queries:"));
-  Serial.println(F("  STATUS?   LIMITS?   A0TEST 0|1   HELP   PING"));
+  Serial.println(F("  STATUS?   LIMITS?   A1?   A0TEST 0|1   HELP   PING"));
   Serial.println(F("Mapping: X=MOTORX  Y=MOTORY  Z=onboard TMC2209"));
   Serial.println(F("Limits:  X<->LSX1/LSX2   Y<->LSY1/LSY2   Z=none"));
 }
@@ -975,6 +1053,11 @@ static void cmd_limits(){
   Serial.print(F(" LSY2=")); Serial.println(limit_active(PIN_LSY2) ? 1 : 0);
 }
 
+static void cmd_a1(){
+  Serial.print(F("A1="));
+  Serial.println(analogRead(A1));
+}
+
 static void update_a0_test(){
   if(!g_a0_test_enabled) return;
 
@@ -1013,6 +1096,7 @@ static void handle_line(char* line){
   if(starts_with(tokens[0], "STOP"))  { request_stop_all(true);   return; }
   if(starts_with(tokens[0], "STATUS")){ cmd_status();             return; }
   if(starts_with(tokens[0], "LIMITS")){ cmd_limits();             return; }
+  if(starts_with(tokens[0], "A1"))    { cmd_a1();                 return; }
   if(starts_with(tokens[0], "A0TEST")){
     if(nt < 2){ reply_err(F("A0TEST needs 0/1")); return; }
     g_a0_test_enabled = (atoi(tokens[1]) != 0);
@@ -1021,7 +1105,14 @@ static void handle_line(char* line){
     return;
   }
   if(starts_with(tokens[0], "INIT"))  { initialize();             return; }
-  if(starts_with(tokens[0], "AUTO_PUSH")) { auto_push();          return; }
+  if(starts_with(tokens[0], "AUTO_PUSH")) {
+    uint8_t mask = 0x07;
+    if(nt >= 2){
+      mask = (uint8_t)atoi(tokens[1]);
+    }
+    auto_push(mask);
+    return;
+  }
 
   if(g_auto_push_state != AUTO_PUSH_IDLE){
     reply_err(F("auto_push_busy"));
@@ -1164,6 +1255,7 @@ void setup(){
   pinMode(PIN_LSY1, INPUT_PULLUP);
   pinMode(PIN_LSY2, INPUT_PULLUP);
   pinMode(A0, INPUT);
+  pinMode(A1, INPUT);
 
   // H 桥 / BTS7960
   // R_EN / L_EN 已接 VCC，不占用 Arduino 引脚。

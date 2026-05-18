@@ -288,12 +288,12 @@ def bricks_to_grid(
         angle = math.atan2(float(avg_xy[1]), float(avg_xy[0]))
         z_orient = int(round(math.degrees(angle) / 90)) % 4
 
-        # Determine sorting axis: X-aligned vs Y-aligned
+        # Sort across the layer width, perpendicular to the brick long axis.
         is_x_aligned = abs(avg_long[0]) > abs(avg_long[1])
         if is_x_aligned:
-            layer.sort(key=lambda item: item[1][0])
-        else:
             layer.sort(key=lambda item: item[1][1])
+        else:
+            layer.sort(key=lambda item: item[1][0])
 
         result.layers[y_idx] = layer
 
@@ -507,7 +507,12 @@ class JengaController:
 
     def _run_auto_push(self, target_layer: int, push_mask: int) -> None:
         self._move_to_layer(target_layer)
-        self.arduino.send(f"AUTO_PUSH {push_mask & 0b111}")
+        if (push_mask == 6):
+            self.arduino.send("AUTO_PUSH 4")
+        elif (push_mask == 3):
+            self.arduino.send("AUTO_PUSH 1")
+        else:
+            self.arduino.send(f"AUTO_PUSH {push_mask}")
         deadline = time.monotonic() + 180.0
         last_line = ""
         while time.monotonic() < deadline:
@@ -649,12 +654,19 @@ class JengaController:
                 self.initial_layer_middle_brick_ids[y] = mid_id
 
             axis_flag = 0 if layer_axis_is_y_aligned(grid_result.layers.get(y, [])) else 1
+            slots = (
+                slot_ids.get(0, EMPTY_BRICK_ID),
+                slot_ids.get(1, EMPTY_BRICK_ID),
+                slot_ids.get(2, EMPTY_BRICK_ID),
+            )
+            if axis_flag != 0:
+                slots = self._reverse_layer_slots(slots)
             self.layer_push_states.append(
                 (
                     axis_flag,
-                    slot_ids.get(0, EMPTY_BRICK_ID),
-                    slot_ids.get(1, EMPTY_BRICK_ID),
-                    slot_ids.get(2, EMPTY_BRICK_ID),
+                    slots[0],
+                    slots[1],
+                    slots[2],
                 )
             )
         self.gone_brick_ids.clear()
@@ -1014,6 +1026,8 @@ class JengaController:
                     "[Phase TOWER_INIT] Recorded initially visible tag id(s) for "
                     f"{len(self.initial_tag_ids_by_brick)} brick(s)."
                 )
+                if self.xy_log:
+                    self._print_xy_log("[Phase TOWER_INIT]")
                 print("[Phase TOWER_INIT] Moving Y down after tower initialization...")
                 self._send_and_wait("MOVE Y -10000", timeout=2.0, ignore_errors=True)
                 self._wait_for_done("Y")
