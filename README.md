@@ -28,3 +28,8 @@ mjpython -m mujoco_apriltag_calibration.view_camera_location_calibrated \
   --cam-names cam0 cam1 cam2 cam3 \
   --calib-out calib_cam0.npz calib_cam1.npz calib_cam2.npz calib_cam3.npz
 ```
+
+## TODO
+
+1. Action after all layers tried to be determined
+2. Rasperry Pi 5 transplant
