@@ -118,7 +118,7 @@ LAYER_Z_THRESHOLD = 0.6
 FACE_PUSHROD_THRESHOLD = 0.85
 # Empirical push duration (seconds)
 DEFAULT_PUSH_DURATION = 1.5
-# DC motor duty for push (0-255)
+# ·motor duty for push (0-255)
 DEFAULT_PUSH_DC_DUTY = 180
 # First layer considered by the full-layer AUTO_PUSH search.
 FULL_LAYER_SEARCH_FIRST_LAYER = 1
