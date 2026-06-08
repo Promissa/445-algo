@@ -26,17 +26,11 @@ from calibration_core import (
     get_tag_center,
     solve_camera_pose_from_square_centers,
 )
+from camera_utils import open_camera, parse_cam_arg
 from pupil_apriltags import Detector
 from view_camera_location import FIXED_CAMERA_K
 
 DistanceCompare = Dict[int, Tuple[float, float, float]]
-
-
-def parse_cam_arg(value: str) -> int | str:
-    try:
-        return int(value)
-    except ValueError:
-        return value
 
 
 def draw_detections(
@@ -247,11 +241,7 @@ def main() -> int:
     world_points = np.asarray(args.world_points, dtype=np.float64).reshape(4, 3)
     R_w_g, t_w_g = build_square_frame(world_points)
 
-    cap = cv2.VideoCapture(parse_cam_arg(args.cam))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    if not cap.isOpened():
-        raise SystemExit(f"ERROR: cannot open camera {args.cam!r}")
+    cap = open_camera(parse_cam_arg(args.cam), width=args.width, height=args.height)
 
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))

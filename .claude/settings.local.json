@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(uv python *)"
+      "Bash(uv python *)",
+      "Bash(git -C /Users/pr/Documents/workspace/445-algo show HEAD:src/manual_calib)",
+      "Bash(git *)",
+      "Bash(python *)"
     ]
   }
 }

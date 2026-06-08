@@ -506,6 +506,15 @@ class JengaController:
                     timeout=1.0,
                     check=False,
                 )
+            elif sys.platform == "linux":
+                # Try aplay first (ALSA), fall back to the terminal bell.
+                subprocess.run(
+                    ["aplay", "-q", "/usr/share/sounds/freedesktop/stereo/complete.oga"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=1.0,
+                    check=False,
+                )
             else:
                 sys.stdout.write("\a")
                 sys.stdout.flush()
@@ -1048,12 +1057,6 @@ class JengaController:
         )
 
     def _do_tower_init(self) -> None:
-        if not self.tower_init_y_raised:
-            print("[Phase TOWER_INIT] Moving Y up before tower reconstruction...")
-            self._send_and_wait("MOVE Y 10000", timeout=2.0, ignore_errors=True)
-            self._wait_for_done("Y")
-            self.tower_init_y_raised = True
-
         if not self.tower_init_x_retracted:
             print("[Phase TOWER_INIT] Retracting X before tower reconstruction...")
             self._send_and_wait("MOVE X 10000", timeout=2.0, ignore_errors=True)
@@ -1090,8 +1093,6 @@ class JengaController:
                     self._print_xy_log("[Phase TOWER_INIT]")
                 self._play_done_sound("TOWER_INIT sound")
                 print("[Phase TOWER_INIT] Moving Y down after tower initialization...")
-                self._send_and_wait("MOVE Y -10000", timeout=2.0, ignore_errors=True)
-                self._wait_for_done("Y")
                 self.current_layer_id = 0
                 self._enter_wait()
                 return

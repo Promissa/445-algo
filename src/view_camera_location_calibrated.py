@@ -33,6 +33,7 @@ from calibration_core import (
     get_tag_center,
     solve_camera_pose_from_square_centers,
 )
+from camera_utils import open_camera, parse_cam_arg
 from view_camera_location import (
     _CAM_PALETTES,
     FIXED_CAMERA_K,
@@ -613,16 +614,8 @@ def build_states(
         cal_in = args.calib_in[i] if i < len(args.calib_in) else None
         cal_out = args.calib_out[i] if i < len(args.calib_out) else f"calib_{name}.npz"
 
-        try:
-            cam_idx = int(cam_arg)
-        except ValueError:
-            cam_idx = cam_arg
-
-        cap = cv2.VideoCapture(cam_idx)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-        if not cap.isOpened():
-            raise RuntimeError(f"Cannot open camera '{cam_arg}'")
+        cam_idx = parse_cam_arg(cam_arg)
+        cap = open_camera(cam_idx, width=args.width, height=args.height)
 
         aw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         ah = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -762,8 +755,9 @@ def update_live_capture_windows(
         except cv2.error as exc:
             if not _LIVE_WINDOW_ERROR_PRINTED:
                 print(
-                    "\nOpenCV live capture window failed. On macOS this can happen when "
-                    "cv2.imshow is used together with the MuJoCo viewer under mjpython. "
+                    "\nOpenCV live capture window failed. This can happen when "
+                    "cv2.imshow is used together with the MuJoCo viewer on some platforms, "
+                    "or when no display server is available (e.g. over SSH). "
                     "Run with --no-viewer for OpenCV-only calibration windows.\n"
                     f"OpenCV error: {exc}\n"
                 )

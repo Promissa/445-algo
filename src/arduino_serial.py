@@ -3,7 +3,7 @@
 Examples:
     python src/arduino_serial.py
     python src/arduino_serial.py ping
-    python src/arduino_serial.py --port /dev/tty.usbmodemXXXX init
+    python src/arduino_serial.py --port /dev/ttyACM0 init
     python src/arduino_serial.py command "MOVE X 1000 F 800 A 600"
 """
 
@@ -26,6 +26,9 @@ ARDUINO_PORT_KEYWORDS = (
     "genuino",
     "usbmodem",
     "usbserial",
+    "ttyacm",
+    "ttyusb",
+    "ttyama",      # Raspberry Pi GPIO UART (e.g. /dev/ttyAMA0)
     "ch340",
     "wch",
     "cp210",
