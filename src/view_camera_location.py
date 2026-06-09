@@ -33,7 +33,6 @@ try:
         solve_camera_pose_from_square_centers,
     )
     from .apriltag_utils import detect_apriltags_silent
-    from .camera_utils import open_camera, parse_cam_arg
     from .reconstruction_core import (
         CameraObsInput,
         ReconConfig,
@@ -48,7 +47,6 @@ except ImportError:
         solve_camera_pose_from_square_centers,
     )
     from apriltag_utils import detect_apriltags_silent
-    from camera_utils import open_camera, parse_cam_arg
     from reconstruction_core import (
         CameraObsInput,
         ReconConfig,
@@ -558,8 +556,15 @@ def main() -> None:
         cal_in = args.calib_in[i] if i < len(args.calib_in) else None
         cal_out = args.calib_out[i] if i < len(args.calib_out) else f"calib_{name}.npz"
 
-        cam_idx = parse_cam_arg(cam_arg)
-        cap = open_camera(cam_idx, width=args.width, height=args.height)
+        try:
+            cam_idx = int(cam_arg)
+        except ValueError:
+            cam_idx = cam_arg
+        cap = cv2.VideoCapture(cam_idx)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+        if not cap.isOpened():
+            sys.exit(f"ERROR: Cannot open camera '{cam_arg}'")
         aw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         ah = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         print(f"  [{name}] device={cam_arg} {aw}x{ah}")
