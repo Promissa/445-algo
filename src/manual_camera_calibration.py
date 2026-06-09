@@ -21,6 +21,7 @@ from typing import Dict, Iterable, Tuple
 
 import cv2
 import numpy as np
+from camera_protocol import add_camera_protocol_args, open_camera
 from calibration_core import (
     build_square_frame,
     get_tag_center,
@@ -30,13 +31,6 @@ from pupil_apriltags import Detector
 from view_camera_location import FIXED_CAMERA_K
 
 DistanceCompare = Dict[int, Tuple[float, float, float]]
-
-
-def parse_cam_arg(value: str) -> int | str:
-    try:
-        return int(value)
-    except ValueError:
-        return value
 
 
 def draw_detections(
@@ -192,7 +186,12 @@ def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description="Live single-camera AprilTag turntable calibration."
     )
-    ap.add_argument("--cam", required=True, help="Camera device index or path, e.g. 0")
+    ap.add_argument(
+        "--cam",
+        required=True,
+        help="Camera device index or path, e.g. 0 or /dev/video0 on Debian",
+    )
+    add_camera_protocol_args(ap)
     ap.add_argument(
         "--name", default="", help="Camera name used for the default output filename"
     )
@@ -247,11 +246,18 @@ def main() -> int:
     world_points = np.asarray(args.world_points, dtype=np.float64).reshape(4, 3)
     R_w_g, t_w_g = build_square_frame(world_points)
 
-    cap = cv2.VideoCapture(parse_cam_arg(args.cam))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    if not cap.isOpened():
-        raise SystemExit(f"ERROR: cannot open camera {args.cam!r}")
+    try:
+        opened = open_camera(
+            args.cam,
+            width=args.width,
+            height=args.height,
+            protocol=args.camera_protocol,
+            fourcc=args.camera_fourcc,
+        )
+    except (RuntimeError, ValueError) as exc:
+        raise SystemExit(f"ERROR: {exc}") from exc
+
+    cap = opened.cap
 
     actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -272,7 +278,11 @@ def main() -> int:
         debug=0,
     )
 
-    print(f"camera={args.cam} actual={actual_w}x{actual_h}")
+    format_msg = f" fourcc={opened.fourcc}" if opened.fourcc else ""
+    print(
+        f"camera={opened.source} backend={opened.backend_name}{format_msg} "
+        f"actual={actual_w}x{actual_h}"
+    )
     print(f"K=\n{K}")
     print(f"target tags={tag_ids}")
     print("keys: Space/S save current valid calibration, Q/ESC quit")

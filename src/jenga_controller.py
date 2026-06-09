@@ -49,6 +49,7 @@ try:
         reconstruct_blocks_multi_cam,
     )
     from .apriltag_utils import detect_apriltags_silent
+    from .camera_protocol import add_camera_protocol_args
     from .view_camera_location import (
         BAR_HALF,
         FIXED_CAMERA_K,
@@ -91,6 +92,7 @@ except ImportError:
         reconstruct_blocks_multi_cam,
     )
     from apriltag_utils import detect_apriltags_silent
+    from camera_protocol import add_camera_protocol_args
     from view_camera_location import (
         BAR_HALF,
         FIXED_CAMERA_K,
@@ -1531,8 +1533,9 @@ def parse_args() -> argparse.Namespace:
         "--cams",
         nargs="+",
         default=["0"],
-        help="Camera device indices or paths (up to 4)",
+        help="Camera device indices or paths (up to 4). On Debian, 0 maps to /dev/video0.",
     )
+    add_camera_protocol_args(ap)
     ap.add_argument("--cam-names", nargs="*", default=[])
     ap.add_argument("--calib-in", nargs="*", default=[])
     ap.add_argument("--calib-out", nargs="*", default=[])

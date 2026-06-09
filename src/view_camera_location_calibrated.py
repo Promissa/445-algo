@@ -28,6 +28,7 @@ import mujoco.viewer
 import numpy as np
 from pupil_apriltags import Detector
 
+from camera_protocol import add_camera_protocol_args, open_camera
 from calibration_core import (
     build_square_frame,
     get_tag_center,
@@ -61,8 +62,9 @@ def parse_args() -> argparse.Namespace:
         "--cams",
         nargs="+",
         default=["0"],
-        help="Camera device indices or paths (up to 4)",
+        help="Camera device indices or paths (up to 4). On Debian, 0 maps to /dev/video0.",
     )
+    add_camera_protocol_args(ap)
     ap.add_argument(
         "--calib-in",
         nargs="*",
@@ -614,18 +616,24 @@ def build_states(
         cal_out = args.calib_out[i] if i < len(args.calib_out) else f"calib_{name}.npz"
 
         try:
-            cam_idx = int(cam_arg)
-        except ValueError:
-            cam_idx = cam_arg
-
-        cap = cv2.VideoCapture(cam_idx)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-        if not cap.isOpened():
-            raise RuntimeError(f"Cannot open camera '{cam_arg}'")
+            opened = open_camera(
+                cam_arg,
+                width=args.width,
+                height=args.height,
+                protocol=getattr(args, "camera_protocol", None),
+                fourcc=getattr(args, "camera_fourcc", None),
+            )
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
+        cap = opened.cap
 
         aw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         ah = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        format_msg = f" fourcc={opened.fourcc}" if opened.fourcc else ""
+        print(
+            f"  [{name}] device={opened.source} backend={opened.backend_name}"
+            f"{format_msg} {aw}x{ah}"
+        )
 
         K = FIXED_CAMERA_K.copy()
         dist_coeffs = np.zeros(5, dtype=np.float64)
